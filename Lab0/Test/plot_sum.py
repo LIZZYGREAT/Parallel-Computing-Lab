@@ -5,13 +5,12 @@ import os
 data_file = '.\Lab0\Test\sum_data_0.csv'
 
 
-df = pd.read_csv(data_file)
+df = pd.read_csv(data_file, encoding='utf-16')
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
-# ==========================================
-# 子图 1：绝对执行时间 (使用双对数坐标 log-log)
-# ==========================================
+
+# 子图 1：绝对执行时间
 ax1.plot(df['N'], df['1-way(ms)'], marker='o', label='Trivial (1-way)', color='#7f8c8d', linewidth=2)
 ax1.plot(df['N'], df['2-way(ms)'], marker='s', label='ILP Optimized (2-way)', color='#f39c12', linewidth=2)
 ax1.plot(df['N'], df['4-way(ms)'], marker='^', label='ILP Optimized (4-way)', color='#e74c3c', linewidth=2)
@@ -25,9 +24,7 @@ ax1.set_ylabel('Time (ms, Log Scale)', fontsize=12)
 ax1.grid(True, which="both", ls="--", alpha=0.5)
 ax1.legend()
 
-# ==========================================
 # 子图 2：超标量加速比 (X轴对数，Y轴线性)
-# ==========================================
 ax2.plot(df['N'], df['Speedup_2'], marker='s', label='2-way Speedup', color='#f39c12', linewidth=2)
 ax2.plot(df['N'], df['Speedup_4'], marker='^', label='4-way Speedup', color='#e74c3c', linewidth=2)
 
