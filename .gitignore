@@ -3,3 +3,7 @@ Introduction for Kunpeng
 *.exe
 *.vscode
 *.pptx
+*.png
+*.jpg
+*.csv
+document*
