@@ -4,26 +4,20 @@ import os
 
 data_file = '.\Lab0\Test\indirect_d_data.csv'
 
-if not os.path.exists(data_file):
-    print(f"错误：找不到 '{data_file}'，请先运行 C++ 程序生成数据。")
-    exit()
-
 try:
     df = pd.read_csv(data_file)
 except UnicodeDecodeError:
     df = pd.read_csv(data_file, encoding='utf-16')
 
-# 提取基准时间 (D=0 时的行)
+# 提取基准时间
 baseline_time = df[df['Distance_D'] == 0]['Time(ms)'].values[0]
 
-# 过滤出有预取的数据点 (D > 0)
+# 过滤出有预取的数据点
 df_pf = df[df['Distance_D'] > 0]
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-# ==========================================
-# 子图 1：绝对执行时间随预取距离的变化
-# ==========================================
+
 ax1.plot(df_pf['Distance_D'], df_pf['Time(ms)'], marker='o', color='#3498db', linewidth=2, label='Prefetch Time')
 ax1.axhline(y=baseline_time, color='#e74c3c', linestyle='--', label='Baseline Time (No Prefetch)')
 
@@ -33,9 +27,7 @@ ax1.set_ylabel('Time (ms)', fontsize=12)
 ax1.grid(True, linestyle='--', alpha=0.6)
 ax1.legend()
 
-# ==========================================
-# 子图 2：加速比的“甜点”曲线
-# ==========================================
+
 ax2.plot(df_pf['Distance_D'], df_pf['Speedup'], marker='^', color='#2ecc71', linewidth=2, label='Prefetch Speedup')
 ax2.axhline(y=1.0, color='black', linestyle='--', label='Baseline (1x Speedup)')
 

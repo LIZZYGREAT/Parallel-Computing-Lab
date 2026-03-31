@@ -39,27 +39,24 @@ int main() {
 
     mt19937 rng(42);
 
-    // 打印 CSV 表头
     cout << "N,Repeats,Baseline(ms),Prefetch_D64(ms),Speedup" << endl;
 
     // 对数级步进扫描，精准捕捉跨越 L2/L3 Cache 到主存的物理边界
     int steps[] = {1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, 10000000, 30000000};
 
     for (int n : steps) {
-        // 1. 动态限制当前工作集规模：生成 [0, n-1] 范围内的随机索引
         uniform_int_distribution<int> dist(0, n - 1);
         for (int i = 0; i < n + PREFETCH_DIST; i++) {
             indices[i] = dist(rng);
         }
 
-        // 2. 动态自适应重复次数（N 小时多跑几次抗误差，N 大时少跑防止等太久）
+        // 2. 动态自适应重复次数
         int repeats = 30000000 / n;
         if (repeats < 1) repeats = 1;
         if (repeats > 5000) repeats = 5000;
 
-        // ==========================================
         // 算法 A：无预取基准 (Baseline)
-        // ==========================================
+
         QueryPerformanceCounter((LARGE_INTEGER*)&head);
         for (int r = 0; r < repeats; r++) {
             double sum_base = 0.0;
@@ -71,14 +68,12 @@ int main() {
         QueryPerformanceCounter((LARGE_INTEGER*)&tail);
         double time_base = ((tail - head) * 1000.0 / freq) / repeats;
 
-        // ==========================================
         // 算法 B：最优距离 (D=64) 软件预取
-        // ==========================================
+
         QueryPerformanceCounter((LARGE_INTEGER*)&head);
         for (int r = 0; r < repeats; r++) {
             double sum_pf = 0.0;
             for (int i = 0; i < n; i++) {
-                // 向内存控制器提前 D=64 步发射非时间局部性预取指令
                 PREFETCH_NTA(&A[indices[i + PREFETCH_DIST]]);
                 sum_pf += A[indices[i]];
             }
@@ -87,9 +82,7 @@ int main() {
         QueryPerformanceCounter((LARGE_INTEGER*)&tail);
         double time_pf = ((tail - head) * 1000.0 / freq) / repeats;
 
-        // ==========================================
-        // 性能统计
-        // ==========================================
+
         double speedup = time_base / time_pf;
 
         cout << fixed << setprecision(5)

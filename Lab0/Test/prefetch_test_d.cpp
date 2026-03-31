@@ -7,7 +7,6 @@
 
 using namespace std;
 
-// 跨平台预取宏
 #if defined(__GNUC__) || defined(__clang__)
     #define PREFETCH_NTA(addr) __builtin_prefetch((addr), 0, 0)
 #elif defined(_MSC_VER)
@@ -16,9 +15,7 @@ using namespace std;
     #define PREFETCH_NTA(addr)
 #endif
 
-// 锁定问题规模：3000万，确保数据溢出 L3 Cache，完全受限于主存延迟
 const int FIXED_N = 30000000;
-// 最大预取距离测试上限，用于分配安全 padding
 const int MAX_D = 1024; 
 
 double* A;
@@ -47,12 +44,9 @@ int main() {
 
     cout << "Distance_D,Repeats,Time(ms),Speedup" << endl;
 
-    // 为了获取稳定的基准时间，固定重复运行 3 次求均值
     int repeats = 3;
 
-    // ==========================================
-    // 算法 A：无预取基准 (Baseline, 相当于 D=0)
-    // ==========================================
+    // 算法 A：无预取基准
     QueryPerformanceCounter((LARGE_INTEGER*)&head);
     for (int r = 0; r < repeats; r++) {
         double sum_base = 0.0;
@@ -64,12 +58,10 @@ int main() {
     QueryPerformanceCounter((LARGE_INTEGER*)&tail);
     double time_base = ((tail - head) * 1000.0 / freq) / repeats;
     
-    // 输出基准数据 (D=0, 自身加速比为 1.0)
+    // 输出基准数据
     cout << fixed << setprecision(5) << 0 << "," << repeats << "," << time_base << "," << 1.00000 << endl;
 
-    // ==========================================
     // 算法 B：梯度扫描预取距离 D
-    // ==========================================
     int distances[] = {4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512};
 
     for (int d : distances) {

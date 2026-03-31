@@ -16,15 +16,15 @@ ax1.plot(df['N'], df['2-way(ms)'], marker='s', label='ILP Optimized (2-way)', co
 ax1.plot(df['N'], df['4-way(ms)'], marker='^', label='ILP Optimized (4-way)', color='#e74c3c', linewidth=2)
 ax1.plot(df['N'], df['Merge(ms)'], marker='x', label='Recursive Merge', color='#9b59b6', linewidth=2, linestyle=':')
 
-ax1.set_xscale('log') # 关键：X轴使用对数系
-ax1.set_yscale('log') # 关键：Y轴时间跨度太大，使用对数系
+ax1.set_xscale('log')
+ax1.set_yscale('log') 
 ax1.set_title('Execution Time vs Array Size (Log-Log Scale)', fontsize=13, fontweight='bold')
 ax1.set_xlabel('Array Size N (Log Scale)', fontsize=12)
 ax1.set_ylabel('Time (ms, Log Scale)', fontsize=12)
 ax1.grid(True, which="both", ls="--", alpha=0.5)
 ax1.legend()
 
-# 子图 2：超标量加速比 (X轴对数，Y轴线性)
+# 子图 2：超标量加速比 
 ax2.plot(df['N'], df['Speedup_2'], marker='s', label='2-way Speedup', color='#f39c12', linewidth=2)
 ax2.plot(df['N'], df['Speedup_4'], marker='^', label='4-way Speedup', color='#e74c3c', linewidth=2)
 
