@@ -2,8 +2,6 @@
 #pragma once
 #include <queue>
 
-
-
 std::priority_queue<std::pair<float, uint32_t> > flat_search(float* base, float* query, size_t base_number, size_t vecdim, size_t k) {
     std::priority_queue<std::pair<float, uint32_t> > q;
 
@@ -27,4 +25,3 @@ std::priority_queue<std::pair<float, uint32_t> > flat_search(float* base, float*
     }
     return q;
 }
-

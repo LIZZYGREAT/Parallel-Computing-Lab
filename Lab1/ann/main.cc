@@ -8,10 +8,11 @@
 #include <iomanip>
 #include <sstream>
 #include <sys/time.h>
+#include <stdlib.h> 
 #include <omp.h>
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "flat_scan.h"
-// 可以自行添加需要的头文件
+#include "scan.h"
 
 using namespace hnswlib;
 
@@ -38,63 +39,63 @@ T *LoadData(std::string data_path, size_t& n, size_t& d)
 struct SearchResult
 {
     float recall;
-    int64_t latency; // 单位us
+    int64_t latency;
 };
-
-void build_index(float* base, size_t base_number, size_t vecdim)
-{
-    const int efConstruction = 150; // 为防止索引构建时间过长，efc建议设置200以下
-    const int M = 16; // M建议设置为16以下
-
-    HierarchicalNSW<float> *appr_alg;
-    InnerProductSpace ipspace(vecdim);
-    appr_alg = new HierarchicalNSW<float>(&ipspace, base_number, M, efConstruction);
-
-    appr_alg->addPoint(base, 0);
-    #pragma omp parallel for
-    for(int i = 1; i < base_number; ++i) {
-        appr_alg->addPoint(base + 1ll*vecdim*i, i);
-    }
-
-    char path_index[1024] = "files/hnsw.index";
-    appr_alg->saveIndex(path_index);
-}
-
 
 int main(int argc, char *argv[])
 {
     size_t test_number = 0, base_number = 0;
     size_t test_gt_d = 0, vecdim = 0;
 
-    std::string data_path = "/anndata/"; 
+    std::string data_path = "./anndata/"; 
     auto test_query = LoadData<float>(data_path + "DEEP100K.query.fbin", test_number, vecdim);
     auto test_gt = LoadData<int>(data_path + "DEEP100K.gt.query.100k.top100.bin", test_number, test_gt_d);
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
-    // 只测试前2000条查询
+    
     test_number = 2000;
-
     const size_t k = 10;
 
     std::vector<SearchResult> results;
     results.resize(test_number);
 
-    // 如果你需要保存索引，可以在这里添加你需要的函数，你可以将下面的注释删除来查看pbs是否将build.index返回到你的files目录中
-    // 要保存的目录必须是files/*
-    // 每个人的目录空间有限，不需要的索引请及时删除，避免占空间太大
-    // 不建议在正式测试查询时同时构建索引，否则性能波动会较大
-    // 下面是一个构建hnsw索引的示例
-    // build_index(base, base_number, vecdim);
+    // 1. 使用 posix_memalign 分配 32 字节对齐的内存
+    float* aligned_aosoa_base = nullptr;
+    if (posix_memalign((void**)&aligned_aosoa_base, 32, base_number * vecdim * sizeof(float)) != 0) {
+        std::cerr << "Memory alignment allocation failed!" << "\n";
+        return -1;
+    }
 
+    // 2. 将原生的 AoS 数据重排为 AoSoA (Block Size = 4)
+    const size_t simd_width = 4;
+    for (size_t block_idx = 0; block_idx < base_number / simd_width; ++block_idx) {
+        size_t block_start_aligned = block_idx * simd_width * vecdim;
+        for (size_t d = 0; d < vecdim; ++d) {
+            for (size_t v = 0; v < simd_width; ++v) {
+                float val = base[(block_idx * simd_width + v) * vecdim + d];
+                aligned_aosoa_base[block_start_aligned + d * simd_width + v] = val;
+            }
+        }
+    }
     
+    // 处理可能的尾部数据
+    size_t tail_start = (base_number / simd_width) * simd_width;
+    for (size_t i = tail_start; i < base_number; ++i) {
+        for (size_t d = 0; d < vecdim; ++d) {
+            aligned_aosoa_base[tail_start * vecdim + (i - tail_start) * vecdim + d] = base[i * vecdim + d];
+        }
+    }
+
+    // 3. 预先分配用于搜索阶段的全局结果缓冲
+    QueryResult* global_results = new QueryResult[base_number];
+    // =========================================================================
+
     // 查询测试代码
     for(int i = 0; i < test_number; ++i) {
         const unsigned long Converter = 1000 * 1000;
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
-        // 该文件已有代码中你只能修改该函数的调用方式
-        // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        auto res = flat_search_aosoa(aligned_aosoa_base, test_query + i*vecdim, base_number, vecdim, k, global_results);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
@@ -125,8 +126,15 @@ int main(int argc, char *argv[])
         avg_latency += results[i].latency;
     }
 
-    // 浮点误差可能导致一些精确算法平均recall不是1
     std::cout << "average recall: "<<avg_recall / test_number<<"\n";
     std::cout << "average latency (us): "<<avg_latency / test_number<<"\n";
+    
+    // 释放内存
+    free(aligned_aosoa_base);
+    delete[] global_results;
+    delete[] base; 
+    delete[] test_query;
+    delete[] test_gt;
+
     return 0;
 }
