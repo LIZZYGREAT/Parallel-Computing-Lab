@@ -8,20 +8,54 @@
 #include <algorithm>
 #include <iostream>
 #include <cstring>
+#include <arm_neon.h>
 
 
 constexpr int PQ_D = 96;          // 原始向量维度
-constexpr int PQ_M = 24;          // 子空间数量 24
-constexpr int PQ_K = 256;         // 每个子空间的聚类中心数 
-constexpr int PQ_D_SUB = 4;       // 每个子空间的维度
+constexpr int PQ_M = 16;          //子空间数量16
+constexpr int PQ_K = 256;         // 每个子空间的聚类中心数
+constexpr int PQ_D_SUB = 6;       // 每个子空间的维度
 constexpr int PREFETCH_DIST = 16; // 软件预取距离 
-constexpr int TOP_C = 200;        
+constexpr int TOP_C = 100;        
 
-
-struct alignas(32) PQCode {
+struct alignas(16) PQCode {
     uint8_t code[PQ_M];
-    uint8_t padding[32 - PQ_M]; 
 };
+
+
+inline float compute_IP_distance_neon(const float* query_ptr, const float* base_ptr) __attribute__((always_inline));
+inline float compute_IP_distance_neon(const float* query_ptr, const float* base_ptr) {
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+    for (size_t d = 0; d < 96; d += 16) {
+        float32x4_t q0 = vld1q_f32(query_ptr + d);
+        float32x4_t b0 = vld1q_f32(base_ptr + d);
+        sum0 = vmlaq_f32(sum0, q0, b0);
+
+        float32x4_t q1 = vld1q_f32(query_ptr + d + 4);
+        float32x4_t b1 = vld1q_f32(base_ptr + d + 4);
+        sum1 = vmlaq_f32(sum1, q1, b1);
+
+        float32x4_t q2 = vld1q_f32(query_ptr + d + 8);
+        float32x4_t b2 = vld1q_f32(base_ptr + d + 8);
+        sum2 = vmlaq_f32(sum2, q2, b2);
+
+        float32x4_t q3 = vld1q_f32(query_ptr + d + 12);
+        float32x4_t b3 = vld1q_f32(base_ptr + d + 12);
+        sum3 = vmlaq_f32(sum3, q3, b3);
+    }
+
+    sum0 = vaddq_f32(sum0, sum1);
+    sum2 = vaddq_f32(sum2, sum3);
+    sum0 = vaddq_f32(sum0, sum2);
+
+    float sum_arr[4];
+    vst1q_f32(sum_arr, sum0);
+    return sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+}
 
 class SubspaceKMeans {
 public:
@@ -100,7 +134,6 @@ public:
 
     void train(const float* base_data, size_t n) {
         std::cerr << "[PQ Info] Starting KMeans training for " << PQ_M << " subspaces...\n";
-        
         std::vector<std::vector<float>> sub_train_data(PQ_M, std::vector<float>(n * PQ_D_SUB));
         
         #pragma omp parallel for schedule(static)
@@ -178,14 +211,13 @@ public:
                 float total_ip = 0.0f;
                 const uint8_t* code = base_codes[i].code;
 
-                #pragma GCC unroll 24
+                #pragma GCC unroll 16
                 for (int m = 0; m < PQ_M; ++m) {
                     total_ip += lut[m][code[m]];
                 }
 
                 float final_dist = 1.0f - total_ip;
 
-                // 维护容量为 TOP_C 的局部候选池
                 if (local_pq.size() < TOP_C) {
                     local_pq.push({final_dist, i});
                 } else if (final_dist < local_pq.top().first) {
@@ -215,12 +247,7 @@ public:
             uint32_t id = candidate_pq.top().second;
             candidate_pq.pop();
             
-            float exact_ip = 0.0f;
-            const float* base_vec = original_base + id * PQ_D;
-
-            for(int d = 0; d < PQ_D; ++d) {
-                exact_ip += query[d] * base_vec[d];
-            }
+            float exact_ip = compute_IP_distance_neon(query, original_base + id * PQ_D);
             float exact_dist = 1.0f - exact_ip;
 
             if (final_pq.size() < top_k) {
