@@ -9,22 +9,25 @@
 #include <iostream>
 #include <cstring>
 
-constexpr int PQ_D = 96;          // 原始向量维度
-constexpr int PQ_M = 12;          // 子空间数量
-constexpr int PQ_K = 256;         // 每个子空间的聚类中心数
-constexpr int PQ_D_SUB = 8;       // 每个子空间的维度
-constexpr int PREFETCH_DIST = 16; 
 
-struct alignas(16) PQCode {
+constexpr int PQ_D = 96;          // 原始向量维度
+constexpr int PQ_M = 24;          // 子空间数量 24
+constexpr int PQ_K = 256;         // 每个子空间的聚类中心数 
+constexpr int PQ_D_SUB = 4;       // 每个子空间的维度
+constexpr int PREFETCH_DIST = 16; // 软件预取距离 
+constexpr int TOP_C = 200;        
+
+
+struct alignas(32) PQCode {
     uint8_t code[PQ_M];
-    uint8_t padding[16 - PQ_M]; 
+    uint8_t padding[32 - PQ_M]; 
 };
 
 class SubspaceKMeans {
 public:
     int d; 
     int k; 
-    std::vector<float> centroids;
+    std::vector<float> centroids; 
 
     SubspaceKMeans(int dim = PQ_D_SUB, int num_clusters = PQ_K) : d(dim), k(num_clusters) {
         centroids.resize(k * d, 0.0f);
@@ -46,7 +49,6 @@ public:
         std::vector<float> new_centroids(k * d, 0.0f);
         std::vector<int> counts(k, 0);
 
-        // 2. 迭代收敛
         for (int iter = 0; iter < max_iter; ++iter) {
             std::fill(new_centroids.begin(), new_centroids.end(), 0.0f);
             std::fill(counts.begin(), counts.end(), 0);
@@ -98,7 +100,7 @@ public:
 
     void train(const float* base_data, size_t n) {
         std::cerr << "[PQ Info] Starting KMeans training for " << PQ_M << " subspaces...\n";
-
+        
         std::vector<std::vector<float>> sub_train_data(PQ_M, std::vector<float>(n * PQ_D_SUB));
         
         #pragma omp parallel for schedule(static)
@@ -139,9 +141,9 @@ public:
         }
     }
 
-    // 在线查询阶段：非对称距离计算 (ADC) 核心搜索函数
     std::priority_queue<std::pair<float, uint32_t>> search(
         const PQCode* base_codes, 
+        const float* original_base, 
         const float* query, 
         size_t base_number, 
         size_t top_k
@@ -161,18 +163,14 @@ public:
             }
         }
 
-        // 2. 线路A全局归并：声明全局堆
-        std::priority_queue<std::pair<float, uint32_t>> global_pq;
+        std::priority_queue<std::pair<float, uint32_t>> candidate_pq;
 
-        // 3. 多线程 Map 阶段
         #pragma omp parallel
         {
             std::priority_queue<std::pair<float, uint32_t>> local_pq;
             
-            // 静态均分任务，极小化线程调度开销
             #pragma omp for schedule(static)
             for (size_t i = 0; i < base_number; ++i) {
-                // 软件预取：打破内存墙
                 if (i + PREFETCH_DIST < base_number) {
                     __builtin_prefetch(base_codes + i + PREFETCH_DIST, 0, 0);
                 }
@@ -180,17 +178,15 @@ public:
                 float total_ip = 0.0f;
                 const uint8_t* code = base_codes[i].code;
 
-                // 强制展开标量流水线
-                #pragma GCC unroll 12
+                #pragma GCC unroll 24
                 for (int m = 0; m < PQ_M; ++m) {
                     total_ip += lut[m][code[m]];
                 }
 
-                // 转换回 flat_scan 的标准距离体系：1 - IP
                 float final_dist = 1.0f - total_ip;
 
-                // 维护局部 Top-K
-                if (local_pq.size() < top_k) {
+                // 维护容量为 TOP_C 的局部候选池
+                if (local_pq.size() < TOP_C) {
                     local_pq.push({final_dist, i});
                 } else if (final_dist < local_pq.top().first) {
                     local_pq.pop();
@@ -198,22 +194,43 @@ public:
                 }
             }
 
-            // 4. Reduce 阶段：串行合并局部结果
             #pragma omp critical
             {
                 while (!local_pq.empty()) {
                     auto top = local_pq.top();
                     local_pq.pop();
-                    if (global_pq.size() < top_k) {
-                        global_pq.push(top);
-                    } else if (top.first < global_pq.top().first) {
-                        global_pq.pop();
-                        global_pq.push(top);
+                    if (candidate_pq.size() < TOP_C) {
+                        candidate_pq.push(top);
+                    } else if (top.first < candidate_pq.top().first) {
+                        candidate_pq.pop();
+                        candidate_pq.push(top);
                     }
                 }
             }
         }
 
-        return global_pq;
+        std::priority_queue<std::pair<float, uint32_t>> final_pq;
+        
+        while(!candidate_pq.empty()) {
+            uint32_t id = candidate_pq.top().second;
+            candidate_pq.pop();
+            
+            float exact_ip = 0.0f;
+            const float* base_vec = original_base + id * PQ_D;
+
+            for(int d = 0; d < PQ_D; ++d) {
+                exact_ip += query[d] * base_vec[d];
+            }
+            float exact_dist = 1.0f - exact_ip;
+
+            if (final_pq.size() < top_k) {
+                final_pq.push({exact_dist, id});
+            } else if (exact_dist < final_pq.top().first) {
+                final_pq.pop();
+                final_pq.push({exact_dist, id});
+            }
+        }
+
+        return final_pq;
     }
 };
