@@ -10,9 +10,12 @@
 #include <sys/time.h>
 #include <stdlib.h> 
 #include <omp.h>
+#include <queue>
+
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "flat_scan.h"
 #include "scan.h"
+#include "sq_quantization.h"
 
 using namespace hnswlib;
 
@@ -42,6 +45,32 @@ struct SearchResult
     int64_t latency;
 };
 
+
+inline std::priority_queue<std::pair<float, int>> sq_flat_search(
+    const uint8_t* sq_base,
+    const uint8_t* sq_query,
+    size_t base_number,
+    size_t vecdim,
+    size_t k,
+    QueryResult* global_results
+) {
+    for (size_t i = 0; i < base_number; ++i) {
+        uint32_t dist = compute_L2_distance_sq_neon(sq_query, sq_base + i * vecdim, vecdim);  
+
+        global_results[i].dist = static_cast<float>(dist);
+        global_results[i].id = i;
+    }
+
+    std::nth_element(global_results, global_results + k, global_results + base_number);
+
+    std::priority_queue<std::pair<float, int>> pq;
+    for (size_t i = 0; i < k; ++i) {
+        pq.push({global_results[i].dist, (int)global_results[i].id});
+    }
+
+    return pq;
+}
+
 int main(int argc, char *argv[])
 {
     size_t test_number = 0, base_number = 0;
@@ -58,44 +87,34 @@ int main(int argc, char *argv[])
     std::vector<SearchResult> results;
     results.resize(test_number);
 
-    // 1. 使用 posix_memalign 分配 32 字节对齐的内存
-    float* aligned_aosoa_base = nullptr;
-    if (posix_memalign((void**)&aligned_aosoa_base, 32, base_number * vecdim * sizeof(float)) != 0) {
+
+    SQQuantizer sq;
+    sq.train(base, base_number, vecdim);
+
+    uint8_t* aligned_sq_base = nullptr;
+    if (posix_memalign((void**)&aligned_sq_base, 32, base_number * vecdim * sizeof(uint8_t)) != 0) {
         std::cerr << "Memory alignment allocation failed!" << "\n";
         return -1;
     }
 
-    // 2. 将原生的 AoS 数据重排为 AoSoA (Block Size = 4)
-    const size_t simd_width = 4;
-    for (size_t block_idx = 0; block_idx < base_number / simd_width; ++block_idx) {
-        size_t block_start_aligned = block_idx * simd_width * vecdim;
-        for (size_t d = 0; d < vecdim; ++d) {
-            for (size_t v = 0; v < simd_width; ++v) {
-                float val = base[(block_idx * simd_width + v) * vecdim + d];
-                aligned_aosoa_base[block_start_aligned + d * simd_width + v] = val;
-            }
-        }
-    }
-    
-    // 处理可能的尾部数据
-    size_t tail_start = (base_number / simd_width) * simd_width;
-    for (size_t i = tail_start; i < base_number; ++i) {
-        for (size_t d = 0; d < vecdim; ++d) {
-            aligned_aosoa_base[tail_start * vecdim + (i - tail_start) * vecdim + d] = base[i * vecdim + d];
-        }
+    sq.encode_batch(base, aligned_sq_base, base_number, vecdim);
+
+    uint8_t* sq_query_buf = nullptr;
+    if (posix_memalign((void**)&sq_query_buf, 32, vecdim * sizeof(uint8_t)) != 0) {
+        std::cerr << "Query buffer alignment allocation failed!" << "\n";
+        return -1;
     }
 
-    // 3. 预先分配用于搜索阶段的全局结果缓冲
     QueryResult* global_results = new QueryResult[base_number];
-    // =========================================================================
-
-    // 查询测试代码
+    
     for(int i = 0; i < test_number; ++i) {
         const unsigned long Converter = 1000 * 1000;
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
-        auto res = flat_search_aosoa(aligned_aosoa_base, test_query + i*vecdim, base_number, vecdim, k, global_results);
+        sq.encode(test_query + i * vecdim, sq_query_buf, vecdim);
+
+        auto res = sq_flat_search(aligned_sq_base, sq_query_buf, base_number, vecdim, k, global_results);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
@@ -129,8 +148,8 @@ int main(int argc, char *argv[])
     std::cout << "average recall: "<<avg_recall / test_number<<"\n";
     std::cout << "average latency (us): "<<avg_latency / test_number<<"\n";
     
-    // 释放内存
-    free(aligned_aosoa_base);
+    free(aligned_sq_base);
+    free(sq_query_buf);
     delete[] global_results;
     delete[] base; 
     delete[] test_query;

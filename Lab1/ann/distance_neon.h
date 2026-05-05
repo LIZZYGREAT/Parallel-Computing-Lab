@@ -14,13 +14,11 @@ inline float32x4_t compute_L2_distance_neon_aosoa(
     const float* base_block_ptr,
     const size_t dim
 ) {
-    // 1. 初始化 4 个独立的累加器，打破读后写 (RAW) 数据依赖
     float32x4_t sum0 = vdupq_n_f32(0.0f);
     float32x4_t sum1 = vdupq_n_f32(0.0f);
     float32x4_t sum2 = vdupq_n_f32(0.0f);
     float32x4_t sum3 = vdupq_n_f32(0.0f);
 
-    // 2. 激进的循环展开：每次处理 4 个维度
     for (size_t d = 0; d < dim; d += 4) {
         // --- 维度 d ---
         float32x4_t q0 = vld1q_dup_f32(query_ptr + d);
