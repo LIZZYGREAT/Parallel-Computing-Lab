@@ -10,18 +10,21 @@
 #include <cstring>
 #include <arm_neon.h>
 
-
 constexpr int PQ_D = 96;          // 原始向量维度
-constexpr int PQ_M = 16;          //子空间数量16
+constexpr int PQ_M = 16;          // 子空间数量16
 constexpr int PQ_K = 256;         // 每个子空间的聚类中心数
 constexpr int PQ_D_SUB = 6;       // 每个子空间的维度
 constexpr int PREFETCH_DIST = 16; // 软件预取距离 
-constexpr int TOP_C = 100;        
+constexpr int TOP_C = 100;        // 粗筛保留的候选者数量
 
 struct alignas(16) PQCode {
     uint8_t code[PQ_M];
 };
 
+struct alignas(8) Candidate {
+    float dist;
+    uint32_t id;
+};
 
 inline float compute_IP_distance_neon(const float* query_ptr, const float* base_ptr) __attribute__((always_inline));
 inline float compute_IP_distance_neon(const float* query_ptr, const float* base_ptr) {
@@ -181,6 +184,7 @@ public:
         size_t base_number, 
         size_t top_k
     ) {
+        // 构建非对称查询查找表 (LUT)
         alignas(32) float lut[PQ_M][PQ_K]; 
         
         for (int m = 0; m < PQ_M; ++m) {
@@ -196,11 +200,15 @@ public:
             }
         }
 
-        std::priority_queue<std::pair<float, uint32_t>> candidate_pq;
+        std::vector<Candidate> global_buffer;
 
         #pragma omp parallel
         {
-            std::priority_queue<std::pair<float, uint32_t>> local_pq;
+            const int buffer_capacity = TOP_C * 2;
+            std::vector<Candidate> local_buffer;
+            local_buffer.reserve(buffer_capacity);
+            
+            float local_threshold = std::numeric_limits<float>::max();
             
             #pragma omp for schedule(static)
             for (size_t i = 0; i < base_number; ++i) {
@@ -218,44 +226,82 @@ public:
 
                 float final_dist = 1.0f - total_ip;
 
-                if (local_pq.size() < TOP_C) {
-                    local_pq.push({final_dist, i});
-                } else if (final_dist < local_pq.top().first) {
-                    local_pq.pop();
-                    local_pq.push({final_dist, i});
-                }
-            }
-
-            #pragma omp critical
-            {
-                while (!local_pq.empty()) {
-                    auto top = local_pq.top();
-                    local_pq.pop();
-                    if (candidate_pq.size() < TOP_C) {
-                        candidate_pq.push(top);
-                    } else if (top.first < candidate_pq.top().first) {
-                        candidate_pq.pop();
-                        candidate_pq.push(top);
+                if (final_dist < local_threshold) {
+                    local_buffer.push_back({final_dist, static_cast<uint32_t>(i)});
+                    
+                    if (local_buffer.size() == buffer_capacity) {
+                        std::nth_element(local_buffer.begin(), 
+                                         local_buffer.begin() + TOP_C, 
+                                         local_buffer.end(),
+                                         [](const Candidate& a, const Candidate& b) {
+                                             return a.dist < b.dist;
+                                         });
+                        local_buffer.resize(TOP_C);
+                        local_threshold = local_buffer.back().dist; 
                     }
                 }
             }
+
+            // 局部循环结束，做最后一次收尾清理
+            if (local_buffer.size() > TOP_C) {
+                std::nth_element(local_buffer.begin(), 
+                                 local_buffer.begin() + TOP_C, 
+                                 local_buffer.end(),
+                                 [](const Candidate& a, const Candidate& b) {
+                                     return a.dist < b.dist;
+                                 });
+                local_buffer.resize(TOP_C);
+            }
+
+            // 汇总到全局数组
+            #pragma omp critical
+            {
+                global_buffer.insert(global_buffer.end(), local_buffer.begin(), local_buffer.end());
+            }
         }
 
-        std::priority_queue<std::pair<float, uint32_t>> final_pq;
-        
-        while(!candidate_pq.empty()) {
-            uint32_t id = candidate_pq.top().second;
-            candidate_pq.pop();
-            
-            float exact_ip = compute_IP_distance_neon(query, original_base + id * PQ_D);
-            float exact_dist = 1.0f - exact_ip;
+        // 对所有线程汇总的数据进行终极提取
+        if (global_buffer.size() > TOP_C) {
+            std::nth_element(global_buffer.begin(), 
+                             global_buffer.begin() + TOP_C, 
+                             global_buffer.end(),
+                             [](const Candidate& a, const Candidate& b) {
+                                 return a.dist < b.dist;
+                             });
+            global_buffer.resize(TOP_C);
+        }
 
-            if (final_pq.size() < top_k) {
-                final_pq.push({exact_dist, id});
-            } else if (exact_dist < final_pq.top().first) {
-                final_pq.pop();
-                final_pq.push({exact_dist, id});
+        // 按照真实向量所在的物理 ID 进行升序重排
+        // 使得后续访问 original_base 时，内存地址单调向前，激活 CPU 硬件流预取器
+        std::sort(global_buffer.begin(), global_buffer.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.id < b.id;
+                  });
+
+        // 重新计算精确距离
+        const int RERANK_PREFETCH_DIST = 4;
+        for (size_t i = 0; i < global_buffer.size(); ++i) {
+            if (i + RERANK_PREFETCH_DIST < global_buffer.size()) {
+                uint32_t next_id = global_buffer[i + RERANK_PREFETCH_DIST].id;
+                __builtin_prefetch(original_base + next_id * PQ_D, 0, 0);
             }
+            
+            uint32_t id = global_buffer[i].id;
+            float exact_ip = compute_IP_distance_neon(query, original_base + id * PQ_D);
+            global_buffer[i].dist = 1.0f - exact_ip; 
+        }
+
+        size_t actual_k = std::min(top_k, global_buffer.size());
+        std::partial_sort(global_buffer.begin(), 
+                          global_buffer.begin() + actual_k, 
+                          global_buffer.end(),
+                          [](const Candidate& a, const Candidate& b) {
+                              return a.dist < b.dist;
+                          });
+
+        std::priority_queue<std::pair<float, uint32_t>> final_pq;
+        for (size_t i = 0; i < actual_k; ++i) {
+            final_pq.push({global_buffer[i].dist, global_buffer[i].id});
         }
 
         return final_pq;
