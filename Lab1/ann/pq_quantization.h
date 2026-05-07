@@ -14,12 +14,12 @@
 #endif
 
 #include "opq_matrix.h" 
+#include "profiler.h"
 
 constexpr int PQ_D = 96;          // 原始向量维度
 constexpr int PQ_M = 16;          // 子空间数量16
 constexpr int PQ_K = 256;         // 每个子空间的聚类中心数
 constexpr int PQ_D_SUB = 6;       // 每个子空间的维度
-constexpr int TOP_C = 100;        // 粗筛保留的候选者数量
 
 struct alignas(16) PQCode {
     uint8_t code[PQ_M];
@@ -110,7 +110,6 @@ public:
                 int best_c = 0;
                 for (int c = 0; c < k; ++c) {
                     float dist = 0.0f;
-                    // 对恒定维度 6 进行手动展开，消除跨平台的分支开销
                     if (d == 6) {
                         float d0 = train_data[i * d + 0] - centroids[c * d + 0];
                         float d1 = train_data[i * d + 1] - centroids[c * d + 1];
@@ -286,134 +285,148 @@ public:
         const float* original_base, 
         const float* query, 
         size_t base_number, 
-        size_t top_k
+        size_t top_k,
+        int top_c 
     ) {
         alignas(32) float rotated_query[PQ_D] = {0.0f};
-        for (int j = 0; j < PQ_D; ++j) {
-            float q_val = query[j];
+        {
+            MicroProfiler::Timer t("1_Rotate_Query");
+            for (int j = 0; j < PQ_D; ++j) {
+                float q_val = query[j];
 #if defined(__ARM_NEON) || defined(__aarch64__)
-            float32x4_t v_q = vdupq_n_f32(q_val);
-            for (int i = 0; i < PQ_D; i += 4) {
-                float32x4_t v_rot = vld1q_f32(&rotated_query[i]);
-                float32x4_t v_r = vld1q_f32(&OPQ_R[j][i]);
-                v_rot = vmlaq_f32(v_rot, v_q, v_r);
-                vst1q_f32(&rotated_query[i], v_rot);
-            }
+                float32x4_t v_q = vdupq_n_f32(q_val);
+                for (int i = 0; i < PQ_D; i += 4) {
+                    float32x4_t v_rot = vld1q_f32(&rotated_query[i]);
+                    float32x4_t v_r = vld1q_f32(&OPQ_R[j][i]);
+                    v_rot = vmlaq_f32(v_rot, v_q, v_r);
+                    vst1q_f32(&rotated_query[i], v_rot);
+                }
 #else
-            for (int i = 0; i < PQ_D; ++i) {
-                rotated_query[i] += q_val * OPQ_R[j][i];
-            }
+                for (int i = 0; i < PQ_D; ++i) {
+                    rotated_query[i] += q_val * OPQ_R[j][i];
+                }
 #endif
+            }
         }
 
         alignas(32) float lut[PQ_M][PQ_K]; 
-        for (int m = 0; m < PQ_M; ++m) {
-            const float* sub_query = rotated_query + m * PQ_D_SUB;
-            const float* centroids = subspaces[m].centroids.data();
-            for (int c = 0; c < PQ_K; ++c) {
-                float ip = 0.0f;
-                for (int j = 0; j < PQ_D_SUB; ++j) {
-                    ip += sub_query[j] * centroids[c * PQ_D_SUB + j];
+        {
+            MicroProfiler::Timer t("2_Build_LUT");
+            for (int m = 0; m < PQ_M; ++m) {
+                const float* sub_query = rotated_query + m * PQ_D_SUB;
+                const float* centroids = subspaces[m].centroids.data();
+                for (int c = 0; c < PQ_K; ++c) {
+                    float ip = 0.0f;
+                    for (int j = 0; j < PQ_D_SUB; ++j) {
+                        ip += sub_query[j] * centroids[c * PQ_D_SUB + j];
+                    }
+                    lut[m][c] = ip;
                 }
-                lut[m][c] = ip;
             }
         }
 
         std::vector<Candidate> global_buffer;
-        global_buffer.reserve(omp_get_max_threads() * TOP_C * 2);
+        global_buffer.reserve(omp_get_max_threads() * top_c * 2);
 
-        #pragma omp parallel
         {
-            const int buffer_capacity = std::max(2048, (int)TOP_C * 8);
-            std::vector<Candidate> local_buffer;
-            local_buffer.reserve(buffer_capacity);
-            
-            float local_threshold = std::numeric_limits<float>::max();
-            
-            #pragma omp for schedule(static)
-            for (size_t i = 0; i < base_number; ++i) {
+            MicroProfiler::Timer t("3_ADC_Scan");
+            #pragma omp parallel
+            {
+                const int buffer_capacity = std::max(2048, top_c * 8);
+                std::vector<Candidate> local_buffer;
+                local_buffer.reserve(buffer_capacity);
+                
+                float local_threshold = std::numeric_limits<float>::max();
+                
+                #pragma omp for schedule(static)
+                for (size_t i = 0; i < base_number; ++i) {
 
-                float total_ip = 0.0f;
-                const uint8_t* code = base_codes[i].code;
+                    float total_ip = 0.0f;
+                    const uint8_t* code = base_codes[i].code;
 
-                #pragma GCC unroll 16
-                for (int m = 0; m < PQ_M; ++m) {
-                    total_ip += lut[m][code[m]];
+                    #pragma GCC unroll 16
+                    for (int m = 0; m < PQ_M; ++m) {
+                        total_ip += lut[m][code[m]];
+                    }
+
+                    float final_dist = 1.0f - total_ip;
+
+                    if (final_dist < local_threshold) {
+                        local_buffer.push_back({final_dist, static_cast<uint32_t>(i)});
+                        
+                        if (local_buffer.size() == buffer_capacity) {
+                            std::nth_element(local_buffer.begin(), 
+                                             local_buffer.begin() + top_c, 
+                                             local_buffer.end(),
+                                             [](const Candidate& a, const Candidate& b) {
+                                                 return a.dist < b.dist;
+                                             });
+                            local_buffer.resize(top_c);
+                            local_threshold = local_buffer.back().dist; 
+                        }
+                    }
                 }
 
-                float final_dist = 1.0f - total_ip;
+                if (local_buffer.size() > top_c) {
+                    std::nth_element(local_buffer.begin(), 
+                                     local_buffer.begin() + top_c, 
+                                     local_buffer.end(),
+                                     [](const Candidate& a, const Candidate& b) {
+                                         return a.dist < b.dist;
+                                     });
+                    local_buffer.resize(top_c);
+                }
 
-                if (final_dist < local_threshold) {
-                    local_buffer.push_back({final_dist, static_cast<uint32_t>(i)});
-                    
-                    if (local_buffer.size() == buffer_capacity) {
-                        std::nth_element(local_buffer.begin(), 
-                                         local_buffer.begin() + TOP_C, 
-                                         local_buffer.end(),
-                                         [](const Candidate& a, const Candidate& b) {
-                                             return a.dist < b.dist;
-                                         });
-                        local_buffer.resize(TOP_C);
-                        local_threshold = local_buffer.back().dist; 
-                    }
+                #pragma omp critical
+                {
+                    global_buffer.insert(global_buffer.end(), local_buffer.begin(), local_buffer.end());
                 }
             }
 
-            if (local_buffer.size() > TOP_C) {
-                std::nth_element(local_buffer.begin(), 
-                                 local_buffer.begin() + TOP_C, 
-                                 local_buffer.end(),
+            if (global_buffer.size() > top_c) {
+                std::nth_element(global_buffer.begin(), 
+                                 global_buffer.begin() + top_c, 
+                                 global_buffer.end(),
                                  [](const Candidate& a, const Candidate& b) {
                                      return a.dist < b.dist;
                                  });
-                local_buffer.resize(TOP_C);
-            }
-
-            #pragma omp critical
-            {
-                global_buffer.insert(global_buffer.end(), local_buffer.begin(), local_buffer.end());
+                global_buffer.resize(top_c);
             }
         }
-
-        if (global_buffer.size() > TOP_C) {
-            std::nth_element(global_buffer.begin(), 
-                             global_buffer.begin() + TOP_C, 
-                             global_buffer.end(),
-                             [](const Candidate& a, const Candidate& b) {
-                                 return a.dist < b.dist;
-                             });
-            global_buffer.resize(TOP_C);
-        }
-
-        std::sort(global_buffer.begin(), global_buffer.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.id < b.id;
-                  });
-
-        const int RERANK_PREFETCH_DIST = 4;
-        for (size_t i = 0; i < global_buffer.size(); ++i) {
-            if (i + RERANK_PREFETCH_DIST < global_buffer.size()) {
-                uint32_t next_id = global_buffer[i + RERANK_PREFETCH_DIST].id;
-                __builtin_prefetch(original_base + next_id * PQ_D, 0, 0);
-            }
-            
-            uint32_t id = global_buffer[i].id;
-            
-            float exact_ip = compute_IP_distance(query, original_base + id * PQ_D);
-            global_buffer[i].dist = 1.0f - exact_ip; 
-        }
-
-        size_t actual_k = std::min(top_k, global_buffer.size());
-        std::partial_sort(global_buffer.begin(), 
-                          global_buffer.begin() + actual_k, 
-                          global_buffer.end(),
-                          [](const Candidate& a, const Candidate& b) {
-                              return a.dist < b.dist;
-                          });
 
         std::priority_queue<std::pair<float, uint32_t>> final_pq;
-        for (size_t i = 0; i < actual_k; ++i) {
-            final_pq.push({global_buffer[i].dist, global_buffer[i].id});
+
+        {
+            MicroProfiler::Timer t("4_Exact_Rerank");
+            std::sort(global_buffer.begin(), global_buffer.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                          return a.id < b.id;
+                      });
+
+            const int RERANK_PREFETCH_DIST = 4;
+            for (size_t i = 0; i < global_buffer.size(); ++i) {
+                if (i + RERANK_PREFETCH_DIST < global_buffer.size()) {
+                    uint32_t next_id = global_buffer[i + RERANK_PREFETCH_DIST].id;
+                    __builtin_prefetch(original_base + next_id * PQ_D, 0, 0);
+                }
+                
+                uint32_t id = global_buffer[i].id;
+                
+                float exact_ip = compute_IP_distance(query, original_base + id * PQ_D);
+                global_buffer[i].dist = 1.0f - exact_ip; 
+            }
+
+            size_t actual_k = std::min(top_k, global_buffer.size());
+            std::partial_sort(global_buffer.begin(), 
+                              global_buffer.begin() + actual_k, 
+                              global_buffer.end(),
+                              [](const Candidate& a, const Candidate& b) {
+                                  return a.dist < b.dist;
+                              });
+
+            for (size_t i = 0; i < actual_k; ++i) {
+                final_pq.push({global_buffer[i].dist, global_buffer[i].id});
+            }
         }
 
         return final_pq;
