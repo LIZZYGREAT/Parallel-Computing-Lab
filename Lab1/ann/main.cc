@@ -11,10 +11,35 @@
 #include <stdlib.h> 
 #include <omp.h>
 #include <queue>
+#include <ctime>
 
 #include "pq_quantization.h"
 
 using namespace std;
+
+// 异步持久化日志记录：写入到 files/ 目录下以防止被 test.o 覆盖
+void save_persistent_log(float avg_recall, float avg_latency) {
+    std::time_t now = std::time(nullptr);
+    std::tm* ltm = std::localtime(&now);
+
+    std::stringstream ss;
+    ss << "files/result_" 
+       << (1900 + ltm->tm_year) << std::setw(2) << std::setfill('0') << (1 + ltm->tm_mon) 
+       << std::setw(2) << std::setfill('0') << ltm->tm_mday << "_" 
+       << std::setw(2) << std::setfill('0') << ltm->tm_hour 
+       << std::setw(2) << std::setfill('0') << ltm->tm_min << ".log";
+
+    std::ofstream fout(ss.str());
+    if (fout.is_open()) {
+        fout << "Average Recall: " << avg_recall << std::endl;
+        fout << "Average Latency: " << avg_latency << " us" << std::endl;
+        fout << "Timestamp: " << std::asctime(ltm);
+        fout.close();
+        std::cerr << "[System] Result successfully saved to " << ss.str() << std::endl;
+    } else {
+        std::cerr << "[Error] Failed to write to files/ directory! Please check permissions." << std::endl;
+    }
+}
 
 template<typename T>
 T *LoadData(std::string data_path, size_t& n, size_t& d)
@@ -106,9 +131,14 @@ int main(int argc, char *argv[])
         avg_latency += results[i].latency;
     }
 
-    std::cout << "average recall: "<<avg_recall / test_number<<"\n";
-    std::cout << "average latency (us): "<<avg_latency / test_number<<"\n";
+    float final_recall = avg_recall / test_number;
+    float final_latency = avg_latency / test_number;
+
+    std::cout << "average recall: " << final_recall << "\n";
+    std::cout << "average latency (us): " << final_latency << "\n";
     
+    save_persistent_log(final_recall, final_latency);
+
     free(aligned_base_codes);
     delete[] base; 
     delete[] test_query;
