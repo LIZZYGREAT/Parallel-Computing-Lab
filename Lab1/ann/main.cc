@@ -14,10 +14,11 @@
 #include <ctime>
 
 #include "profiler.h"
-#include "pq_quantization.h"
+#include "fast_scan.h" 
 
 using namespace std;
 
+// 异步持久化日志记录
 void save_persistent_log(float avg_recall, float avg_latency) {
     std::time_t now = std::time(nullptr);
     std::tm* ltm = std::localtime(&now);
@@ -68,13 +69,13 @@ struct SearchResult
 };
 
 void run_evaluation(int thread_count, int top_c, PQQuantizer& pq_engine, 
-                    const PQCode* aligned_base_codes, const float* base, 
+                    const void* aligned_base_blocks, const float* base, 
                     const float* test_query, const int* test_gt, 
                     size_t test_number, size_t base_number, size_t vecdim, size_t test_gt_d, size_t k,
                     std::ofstream& csv_file) {
     
     omp_set_num_threads(thread_count);
-    MicroProfiler::reset(); 
+    MicroProfiler::reset(); // 每次评估前重置计时器
 
     std::vector<SearchResult> results(test_number);
 
@@ -83,7 +84,8 @@ void run_evaluation(int thread_count, int top_c, PQQuantizer& pq_engine,
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
-        auto res = pq_engine.search(aligned_base_codes, base, test_query + i * vecdim, base_number, k, top_c);
+        // 调用 FastScan 引擎的搜索逻辑
+        auto res = pq_engine.search(aligned_base_blocks, base, test_query + i * vecdim, base_number, k, top_c);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
@@ -120,12 +122,10 @@ void run_evaluation(int thread_count, int top_c, PQQuantizer& pq_engine,
     std::cerr << "[Result] Threads: " << thread_count << " | Top_C: " << top_c 
               << " | Recall: " << final_recall << " | Latency: " << final_latency << " us\n";
               
-    // 将宏观结果写入 CSV
     if (csv_file.is_open()) {
         csv_file << thread_count << "," << top_c << "," << final_recall << "," << final_latency << "\n";
     }
     
-    // 打印并保存微观阶段耗时
     std::string profiler_log_path = "files/profiler_detail_T" + std::to_string(thread_count) + "_C" + std::to_string(top_c) + ".csv";
     MicroProfiler::print_and_save(profiler_log_path);
 }
@@ -144,35 +144,34 @@ int main(int argc, char *argv[])
     test_number = 2000;
     const size_t k = 10;
 
-    // 离线阶段：训练与编码
+    // 离线阶段：训练 FastScan 聚类中心
     PQQuantizer pq_engine;
     pq_engine.train(base, base_number);
 
-    PQCode* aligned_base_codes = nullptr;
-    if (posix_memalign((void**)&aligned_base_codes, 64, base_number * sizeof(PQCode)) != 0) {
-        std::cerr << "Memory alignment allocation failed!" << "\n";
+    size_t num_blocks = base_number / 32;
+    FSBlock* aligned_base_blocks = nullptr;
+    
+    if (posix_memalign((void**)&aligned_base_blocks, 64, num_blocks * sizeof(FSBlock)) != 0) {
+        std::cerr << "Memory alignment allocation failed for FastScan Blocks!" << "\n";
         return -1;
     }
 
-    pq_engine.encode_batch(base, aligned_base_codes, base_number);
+    pq_engine.encode_batch(base, aligned_base_blocks, base_number);
 
     std::ofstream csv_file("files/latency_recall_tradeoff.csv", std::ios::app);
     if (csv_file.is_open()) {
         csv_file << "Threads,Top_C,Recall@10,Latency(us)\n";
     }
 
-    // 参数扫描空间设计
-    // 1. 测试不同线程加速比
     std::vector<int> thread_configs = {1, 2, 4, 8}; 
-    // 2. 测试召回率与延迟的折中，验证 ADC 查表的 Trade-off
     std::vector<int> top_c_configs = {20, 50, 100, 200, 500}; 
 
-    std::cerr << "\n[System] Starting Automated Grid Search Evaluation...\n";
+    std::cerr << "\n[System] Starting Automated Grid Search Evaluation (FastScan Enabled)...\n";
 
     for (int t : thread_configs) {
         for (int c : top_c_configs) {
             std::cerr << "\n>>> Running config: Threads=" << t << ", Top_C=" << c << "\n";
-            run_evaluation(t, c, pq_engine, aligned_base_codes, base, test_query, test_gt, 
+            run_evaluation(t, c, pq_engine, aligned_base_blocks, base, test_query, test_gt, 
                            test_number, base_number, vecdim, test_gt_d, k, csv_file);
         }
     }
@@ -181,9 +180,10 @@ int main(int argc, char *argv[])
         csv_file.close();
     }
 
-    std::cerr << "\n[System] All evaluations completed. Check files/ directory for results.\n";
+    std::cerr << "\n[System] All evaluations completed. Check files/ directory for FastScan results.\n";
 
-    free(aligned_base_codes);
+    // 释放重构后的 Block 内存
+    free(aligned_base_blocks);
     delete[] base; 
     delete[] test_query;
     delete[] test_gt;

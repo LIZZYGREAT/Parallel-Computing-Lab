@@ -113,7 +113,7 @@ def plot_stacked_bars(df):
 
 if __name__ == "__main__":
     print("[System] 正在解析微观 Profiler 数据...")
-    df_all = load_profiler_data(data_dir="files")
+    df_all = load_profiler_data(data_dir="files/fastscan_data")
     
     if not df_all.empty:
         plot_stacked_bars(df_all)
