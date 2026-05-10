@@ -4,3 +4,11 @@ Introduction for Kunpeng
 *.vscode
 *.pptx
 document*
+Makefile
+*SIMD
+*hnswlib
+*.sh
+*file.txt
+*help.md
+*files
+*anndata
