@@ -66,5 +66,5 @@ def plot_latency_recall_tradeoff(csv_path):
     
 
 if __name__ == "__main__":
-    data_file = "files/fastscan_data/latency_recall_tradeoff.csv"
+    data_file = "files/pq_data/latency_recall_tradeoff.csv"
     plot_latency_recall_tradeoff(data_file)

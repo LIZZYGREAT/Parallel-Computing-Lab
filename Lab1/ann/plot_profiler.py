@@ -53,10 +53,7 @@ def plot_stacked_bars(df):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), dpi=150)
     plt.rcParams['font.family'] = 'sans-serif'
     
-    # ==========================================
-    # 图 1：固定 Threads = 1，观察随 Top_C 变化的算法复杂度
-    # ==========================================
-    target_thread = 1
+    target_thread = 4
     df_t1 = df[df["Threads"] == target_thread].copy()
     
     if not df_t1.empty:
@@ -113,7 +110,7 @@ def plot_stacked_bars(df):
 
 if __name__ == "__main__":
     print("[System] 正在解析微观 Profiler 数据...")
-    df_all = load_profiler_data(data_dir="files/fastscan_data")
+    df_all = load_profiler_data(data_dir="files/pq_data")
     
     if not df_all.empty:
         plot_stacked_bars(df_all)
