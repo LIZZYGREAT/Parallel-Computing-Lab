@@ -13,3 +13,7 @@ Makefile
 *files
 *anndata
 *.png
+*history
+*perf
+*report
+*figures

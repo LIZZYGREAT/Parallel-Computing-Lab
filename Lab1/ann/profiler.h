@@ -21,7 +21,7 @@ public:
             auto end = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double, std::micro> elapsed = end - start;
             // 确保多线程环境下的数据竞争安全
-            #pragma omp critical
+            #pragma omp critical(micro_profiler)
             {
                 MicroProfilerT::times[name] += elapsed.count();
             }

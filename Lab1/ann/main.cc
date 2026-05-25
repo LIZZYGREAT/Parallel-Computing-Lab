@@ -17,6 +17,7 @@
 #include "ivfpq_index.h"
 #include "adc_searcher.h"
 #include "sdc_searcher.h"
+#include "opq_rotate.h"
 
 using namespace std;
 
@@ -76,20 +77,25 @@ struct SearchResult {
 void run_evaluation(int thread_count, int nprobe, BaseSearcher* searcher, 
                     const float* test_query, const int* test_gt, 
                     size_t test_number, size_t vecdim, size_t test_gt_d, size_t k,
-                    std::ofstream& csv_file, const std::string& method_name) {
+                    std::ofstream& csv_file, const std::string& method_name, bool use_opq) {
     
     omp_set_num_threads(thread_count);
     MicroProfiler::reset(); 
 
     std::vector<SearchResult> results(test_number);
+    std::vector<float> query_buf(vecdim);
 
     for(size_t i = 0; i < test_number; ++i) {
         const unsigned long Converter = 1000 * 1000;
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
-        // 调用多态搜索接口
-        auto res = searcher->search(test_query + i * vecdim, k, nprobe);
+        const float* q = test_query + i * vecdim;
+        if (use_opq) {
+            opq_rotate(q, query_buf.data(), static_cast<int>(vecdim));
+            q = query_buf.data();
+        }
+        auto res = searcher->search(q, k, nprobe);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
@@ -148,17 +154,25 @@ int main(int argc, char *argv[]) {
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
     
     // 测试样本量与 Top-K 设定
-    test_number = 2000;
+    test_number = 20;
     const size_t k = 10;
 
-    // 参数设定：1024 个聚类中心，划分 16 个子空间
     int n_lists = 1024;
     int M = 16;
-    
-    // 1. 离线阶段：构建倒排索引与 PQ 码本
+    const bool use_opq = true;
+
+    std::vector<float> rotated_base;
+    const float* base_for_build = base;
+    if (use_opq) {
+        std::cerr << "[OPQ] Rotating base vectors before IVF-PQ build...\n";
+        rotated_base.resize(base_number * vecdim);
+        opq_rotate_batch(base, rotated_base.data(), base_number, static_cast<int>(vecdim));
+        base_for_build = rotated_base.data();
+    }
+
     IVFPQIndex index(vecdim, n_lists, M);
     MicroProfiler::reset();
-    index.build(base, base_number);
+    index.build(base_for_build, base_number);
     MicroProfiler::print_and_save("files/profiler_build.csv");
 
     // 2. 在线阶段：实例化具体的检索策略
@@ -182,7 +196,7 @@ int main(int argc, char *argv[]) {
         for (int probe : nprobe_configs) {
             std::cerr << "\n>>> Running ADC config: Threads=" << t << ", NProbe=" << probe << "\n";
             run_evaluation(t, probe, &adc_searcher, test_query, test_gt, 
-                           test_number, vecdim, test_gt_d, k, csv_file, "ADC");
+                           test_number, vecdim, test_gt_d, k, csv_file, "ADC", use_opq);
         }
     }
 
@@ -190,7 +204,7 @@ int main(int argc, char *argv[]) {
         for (int probe : nprobe_configs) {
             std::cerr << "\n>>> Running SDC config: Threads=" << t << ", NProbe=" << probe << "\n";
             run_evaluation(t, probe, &sdc_searcher, test_query, test_gt, 
-                           test_number, vecdim, test_gt_d, k, csv_file, "SDC");
+                           test_number, vecdim, test_gt_d, k, csv_file, "SDC", use_opq);
         }
     }
 

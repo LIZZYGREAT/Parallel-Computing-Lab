@@ -121,10 +121,12 @@ public:
                 }
             }
 
-            #pragma omp critical
             {
                 MicroProfiler::Timer _t("7_Thread_Merge");
-                global_topk.insert(global_topk.end(), local_topk.begin(), local_topk.end());
+                #pragma omp critical
+                {
+                    global_topk.insert(global_topk.end(), local_topk.begin(), local_topk.end());
+                }
             }
         }
 
