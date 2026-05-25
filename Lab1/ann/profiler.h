@@ -28,17 +28,33 @@ public:
         }
     };
 
-    static void print_and_save(const std::string& filepath) {
-        std::ofstream fout(filepath, std::ios::app);
+    static void print_and_save(const std::string& filepath, size_t num_samples = 1) {
+        std::ofstream fout(filepath);
         std::cerr << "========== Micro-Profiling Results ==========\n";
+        if (num_samples > 1) {
+            std::cerr << "Samples: " << num_samples << " (per-query avg shown)\n";
+        }
+
+        double total = 0.0;
         for (const auto& pair : times) {
-            std::cerr << pair.first << ": " << pair.second << " us\n";
-            if(fout.is_open()) {
-                fout << pair.first << "," << pair.second << "\n";
+            total += pair.second;
+        }
+
+        for (const auto& pair : times) {
+            double pct = total > 0.0 ? (pair.second / total * 100.0) : 0.0;
+            double avg = pair.second / static_cast<double>(num_samples);
+            std::cerr << pair.first << ": " << pair.second << " us total, "
+                      << avg << " us/avg (" << pct << "%)\n";
+            if (fout.is_open()) {
+                fout << pair.first << "," << pair.second << "," << avg << "\n";
             }
         }
-        std::cerr << "=============================================\n";
-        if(fout.is_open()) fout.close();
+        std::cerr << "Total profiled: " << total << " us";
+        if (num_samples > 1) {
+            std::cerr << " (" << total / num_samples << " us/query avg)";
+        }
+        std::cerr << "\n=============================================\n";
+        if (fout.is_open()) fout.close();
     }
 
     static void reset() { 

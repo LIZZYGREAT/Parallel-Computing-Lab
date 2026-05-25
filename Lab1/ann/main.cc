@@ -14,7 +14,9 @@
 #include <ctime>
 
 #include "profiler.h"
-#include "fast_scan.h" 
+#include "ivfpq_index.h"
+#include "adc_searcher.h"
+#include "sdc_searcher.h"
 
 using namespace std;
 
@@ -43,10 +45,13 @@ void save_persistent_log(float avg_recall, float avg_latency) {
 }
 
 template<typename T>
-T *LoadData(std::string data_path, size_t& n, size_t& d)
-{
+T *LoadData(std::string data_path, size_t& n, size_t& d) {
     std::ifstream fin;
     fin.open(data_path, std::ios::in | std::ios::binary);
+    if (!fin.is_open()) {
+        std::cerr << "[Error] Cannot open file " << data_path << "\n";
+        exit(1);
+    }
     fin.read((char*)&n,4);
     fin.read((char*)&d,4);
     T* data = new T[n*d];
@@ -62,20 +67,19 @@ T *LoadData(std::string data_path, size_t& n, size_t& d)
     return data;
 }
 
-struct SearchResult
-{
+struct SearchResult {
     float recall;
     int64_t latency;
 };
 
-void run_evaluation(int thread_count, int top_c, PQQuantizer& pq_engine, 
-                    const void* aligned_base_blocks, const float* base, 
+// 评估逻辑：接收 BaseSearcher 接口，解除具体算法强耦合
+void run_evaluation(int thread_count, int nprobe, BaseSearcher* searcher, 
                     const float* test_query, const int* test_gt, 
-                    size_t test_number, size_t base_number, size_t vecdim, size_t test_gt_d, size_t k,
-                    std::ofstream& csv_file) {
+                    size_t test_number, size_t vecdim, size_t test_gt_d, size_t k,
+                    std::ofstream& csv_file, const std::string& method_name) {
     
     omp_set_num_threads(thread_count);
-    MicroProfiler::reset(); // 每次评估前重置计时器
+    MicroProfiler::reset(); 
 
     std::vector<SearchResult> results(test_number);
 
@@ -84,8 +88,8 @@ void run_evaluation(int thread_count, int top_c, PQQuantizer& pq_engine,
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
-        // 调用 FastScan 引擎的搜索逻辑
-        auto res = pq_engine.search(aligned_base_blocks, base, test_query + i * vecdim, base_number, k, top_c);
+        // 调用多态搜索接口
+        auto res = searcher->search(test_query + i * vecdim, k, nprobe);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
@@ -99,7 +103,7 @@ void run_evaluation(int thread_count, int top_c, PQQuantizer& pq_engine,
 
         size_t acc = 0;
         while (!res.empty()) {   
-            int x = res.top().second;
+            uint32_t x = res.top().id;
             if(gtset.find(x) != gtset.end()){
                 ++acc;
             }
@@ -119,60 +123,74 @@ void run_evaluation(int thread_count, int top_c, PQQuantizer& pq_engine,
     float final_recall = avg_recall / test_number;
     float final_latency = avg_latency / test_number;
 
-    std::cerr << "[Result] Threads: " << thread_count << " | Top_C: " << top_c 
-              << " | Recall: " << final_recall << " | Latency: " << final_latency << " us\n";
+    std::cerr << "[Result] Method: " << method_name << " | Threads: " << thread_count 
+              << " | NProbe: " << nprobe << " | Recall: " << final_recall 
+              << " | Latency: " << final_latency << " us\n";
+
+    std::stringstream profiler_path;
+    profiler_path << "files/profiler_detail_" << method_name
+                  << "_T" << thread_count << "_P" << nprobe << ".csv";
+    MicroProfiler::print_and_save(profiler_path.str(), test_number);
               
     if (csv_file.is_open()) {
-        csv_file << thread_count << "," << top_c << "," << final_recall << "," << final_latency << "\n";
+        csv_file << method_name << "," << thread_count << "," << nprobe << "," 
+                 << final_recall << "," << final_latency << "\n";
     }
-    
-    std::string profiler_log_path = "files/profiler_detail_T" + std::to_string(thread_count) + "_C" + std::to_string(top_c) + ".csv";
-    MicroProfiler::print_and_save(profiler_log_path);
 }
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
     size_t test_number = 0, base_number = 0;
     size_t test_gt_d = 0, vecdim = 0;
 
     std::string data_path = "./anndata/"; 
     auto test_query = LoadData<float>(data_path + "DEEP100K.query.fbin", test_number, vecdim);
     auto test_gt = LoadData<int>(data_path + "DEEP100K.gt.query.100k.top100.bin", test_number, test_gt_d);
-    
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
     
+    // 测试样本量与 Top-K 设定
     test_number = 2000;
     const size_t k = 10;
 
-    // 离线阶段：训练 FastScan 聚类中心
-    PQQuantizer pq_engine;
-    pq_engine.train(base, base_number);
-
-    size_t num_blocks = base_number / 32;
-    FSBlock* aligned_base_blocks = nullptr;
+    // 参数设定：1024 个聚类中心，划分 16 个子空间
+    int n_lists = 1024;
+    int M = 16;
     
-    if (posix_memalign((void**)&aligned_base_blocks, 64, num_blocks * sizeof(FSBlock)) != 0) {
-        std::cerr << "Memory alignment allocation failed for FastScan Blocks!" << "\n";
-        return -1;
-    }
+    // 1. 离线阶段：构建倒排索引与 PQ 码本
+    IVFPQIndex index(vecdim, n_lists, M);
+    MicroProfiler::reset();
+    index.build(base, base_number);
+    MicroProfiler::print_and_save("files/profiler_build.csv");
 
-    pq_engine.encode_batch(base, aligned_base_blocks, base_number);
+    // 2. 在线阶段：实例化具体的检索策略
+    ADCSearcher adc_searcher(&index);
 
-    std::ofstream csv_file("files/latency_recall_tradeoff.csv", std::ios::app);
+    MicroProfiler::reset();
+    SDCSearcher sdc_searcher(&index);
+    MicroProfiler::print_and_save("files/profiler_sdc_init.csv");
+
+    std::ofstream csv_file("files/ivfpq_tradeoff.csv", std::ios::app);
     if (csv_file.is_open()) {
-        csv_file << "Threads,Top_C,Recall@10,Latency(us)\n";
+        csv_file << "Method,Threads,NProbe,Recall@10,Latency(us)\n";
     }
 
     std::vector<int> thread_configs = {1, 2, 4, 8}; 
-    std::vector<int> top_c_configs = {20, 50, 100, 200, 500}; 
+    std::vector<int> nprobe_configs = {8, 16, 32, 64, 128}; 
 
-    std::cerr << "\n[System] Starting Automated Grid Search Evaluation (FastScan Enabled)...\n";
+    std::cerr << "\n[System] Starting Automated Grid Search Evaluation (IVF-PQ Enabled)...\n";
 
     for (int t : thread_configs) {
-        for (int c : top_c_configs) {
-            std::cerr << "\n>>> Running config: Threads=" << t << ", Top_C=" << c << "\n";
-            run_evaluation(t, c, pq_engine, aligned_base_blocks, base, test_query, test_gt, 
-                           test_number, base_number, vecdim, test_gt_d, k, csv_file);
+        for (int probe : nprobe_configs) {
+            std::cerr << "\n>>> Running ADC config: Threads=" << t << ", NProbe=" << probe << "\n";
+            run_evaluation(t, probe, &adc_searcher, test_query, test_gt, 
+                           test_number, vecdim, test_gt_d, k, csv_file, "ADC");
+        }
+    }
+
+    for (int t : thread_configs) {
+        for (int probe : nprobe_configs) {
+            std::cerr << "\n>>> Running SDC config: Threads=" << t << ", NProbe=" << probe << "\n";
+            run_evaluation(t, probe, &sdc_searcher, test_query, test_gt, 
+                           test_number, vecdim, test_gt_d, k, csv_file, "SDC");
         }
     }
 
@@ -180,10 +198,8 @@ int main(int argc, char *argv[])
         csv_file.close();
     }
 
-    std::cerr << "\n[System] All evaluations completed. Check files/ directory for FastScan results.\n";
+    std::cerr << "\n[System] All evaluations completed. Check files/ivfpq_tradeoff.csv for results.\n";
 
-    // 释放重构后的 Block 内存
-    free(aligned_base_blocks);
     delete[] base; 
     delete[] test_query;
     delete[] test_gt;
