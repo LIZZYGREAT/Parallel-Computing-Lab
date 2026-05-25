@@ -21,8 +21,8 @@ def plot_build_breakdown(out_dir):
     vals = df["Total_us"].values / 1e6
     fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
     ax.barh(labels, vals, color=plt.cm.Paired(range(len(labels))))
-    ax.set_xlabel("耗时 (秒)")
-    ax.set_title("索引构建阶段耗时")
+    ax.set_xlabel("Time (s)")
+    ax.set_title("Index Build Stage Time")
     ax.grid(axis="x", linestyle="--", alpha=0.5)
     plt.tight_layout()
     p = os.path.join(out_dir, "build_breakdown.png")
@@ -45,7 +45,7 @@ def main():
     plot_stage_compare(profiler, threads=4, nprobe=32)
     plot_stage_compare(profiler, threads=8, nprobe=64)
     plot_build_breakdown(ensure_fig_dir())
-    print(f"\n[Done] 图表目录: figures/")
+    print(f"\n[Done] figures saved to: figures/")
 
 
 if __name__ == "__main__":

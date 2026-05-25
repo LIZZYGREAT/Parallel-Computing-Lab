@@ -9,50 +9,7 @@
 #include <cstring>
 #include <random>
 #include <algorithm>
-
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#include <arm_neon.h>
-#elif defined(__AVX2__)
-#include <immintrin.h>
-#endif
-
-inline float compute_L2_sqr(const float* a, const float* b, int d) {
-    float dist = 0.0f;
-    int i = 0;
-
-#if defined(__ARM_NEON) || defined(__aarch64__)
-    float32x4_t sum4 = vdupq_n_f32(0.0f);
-    for (; i <= d - 4; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        float32x4_t diff = vsubq_f32(va, vb);
-        sum4 = vmlaq_f32(sum4, diff, diff);
-    }
-    float sum_arr[4];
-    vst1q_f32(sum_arr, sum4);
-    dist += sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
-
-#elif defined(__AVX2__)
-    __m256 sum8 = _mm256_setzero_ps();
-    for (; i <= d - 8; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        __m256 diff = _mm256_sub_ps(va, vb);
-        sum8 = _mm256_fmadd_ps(diff, diff, sum8);
-    }
-    alignas(32) float sum_arr[8];
-    _mm256_store_ps(sum_arr, sum8);
-    for (int j = 0; j < 8; ++j) {
-        dist += sum_arr[j];
-    }
-#endif
-
-    for (; i < d; ++i) {
-        float diff = a[i] - b[i];
-        dist += diff * diff;
-    }
-    return dist;
-}
+#include "simd_l2.h"
 
 class KMeans {
 public:

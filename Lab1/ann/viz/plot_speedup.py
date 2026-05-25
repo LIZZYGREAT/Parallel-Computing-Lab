@@ -4,14 +4,14 @@ import numpy as np
 from data_loader import load_tradeoff, ensure_fig_dir, DATA_DIR
 
 plt.rcParams["axes.unicode_minus"] = False
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "WenQuanYi Micro Hei", "SimHei", "Arial Unicode MS"]
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
 
 
 def plot_speedup(tradeoff=None, out_dir=None):
     df = tradeoff if tradeoff is not None else load_tradeoff()
     out_dir = out_dir or ensure_fig_dir()
     if df.empty:
-        print("[Error] ivfpq_tradeoff.csv 为空")
+        print("[Error] ivfpq_tradeoff.csv is empty")
         return
 
     nprobes = sorted(df["NProbe"].unique())
@@ -30,9 +30,9 @@ def plot_speedup(tradeoff=None, out_dir=None):
             speedup = b / cur["Latency(us)"].values
             ax.plot(cur["Threads"], speedup, "o-", color=colors[i], linewidth=2, markersize=7, label=f"nprobe={p}")
         ax.axhline(1.0, color="gray", linestyle="--", alpha=0.6)
-        ax.set_title(f"{method} 并行加速比 (基准 T=1)")
-        ax.set_xlabel("线程数")
-        ax.set_ylabel("加速比")
+        ax.set_title(f"{method} Speedup (baseline T=1)")
+        ax.set_xlabel("Threads")
+        ax.set_ylabel("Speedup")
         ax.set_xticks(sorted(sub["Threads"].unique()))
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend(fontsize=8, loc="best")

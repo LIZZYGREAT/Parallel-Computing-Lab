@@ -6,26 +6,33 @@ import pandas as pd
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "files")
 FIG_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
 
+QUERY_THREADS = 4
+QUERY_NPROBE = 64
+
 ADC_STAGES = [
     "1_Coarse_Dist", "2_Coarse_Sort", "3_Compute_Residual", "4_Build_LUT",
-    "5_ADC_Scan", "6_Local_TopK_Trim", "7_Thread_Merge", "8_Global_Merge", "9_Build_Result",
+    "5_FastScan_ADC", "6_Local_TopK_Trim", "7_Thread_Merge", "8_Global_Merge",
+    "8.5_Re_Rank", "9_Build_Result",
 ]
 SDC_STAGES = [
     "1_Coarse_Dist", "2_Coarse_Sort", "3_Compute_Residual", "4_Quantize_Query",
-    "5_SDC_Scan", "6_Local_TopK_Trim", "7_Thread_Merge", "8_Global_Merge", "9_Build_Result",
+    "4.5_Build_LUT", "5_FastScan_SDC", "6_Local_TopK_Trim", "7_Thread_Merge",
+    "8_Global_Merge", "8.5_Re_Rank", "9_Build_Result",
 ]
 STAGE_LABELS = {
-    "1_Coarse_Dist": "粗排距离",
-    "2_Coarse_Sort": "粗排排序",
-    "3_Compute_Residual": "残差计算",
-    "4_Build_LUT": "LUT构建",
-    "4_Quantize_Query": "查询量化",
-    "5_ADC_Scan": "ADC扫描",
-    "5_SDC_Scan": "SDC扫描",
-    "6_Local_TopK_Trim": "局部TopK",
-    "7_Thread_Merge": "线程合并",
-    "8_Global_Merge": "全局合并",
-    "9_Build_Result": "结果构建",
+    "1_Coarse_Dist": "Coarse Dist",
+    "2_Coarse_Sort": "Coarse Sort",
+    "3_Compute_Residual": "Residual",
+    "4_Build_LUT": "Build LUT",
+    "4_Quantize_Query": "Quantize Query",
+    "4.5_Build_LUT": "LUT Pack (SDC)",
+    "5_FastScan_ADC": "FastScan ADC",
+    "5_FastScan_SDC": "FastScan SDC",
+    "6_Local_TopK_Trim": "Local TopK",
+    "7_Thread_Merge": "Thread Merge",
+    "8_Global_Merge": "Global Merge",
+    "8.5_Re_Rank": "Exact Re-rank",
+    "9_Build_Result": "Build Result",
 }
 
 
@@ -75,6 +82,18 @@ def load_profiler_details(data_dir=None):
         except Exception as e:
             print(f"[Warning] skip {fp}: {e}")
     return pd.DataFrame(rows)
+
+
+def load_query_profiler(method, threads=QUERY_THREADS, nprobe=QUERY_NPROBE, data_dir=None):
+    data_dir = data_dir or DATA_DIR
+    path = os.path.join(data_dir, f"profiler_detail_{method}_T{threads}_P{nprobe}.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path, header=None, names=["Stage", "Total_us", "Avg_us"])
+    df["Method"] = method
+    df["Threads"] = threads
+    df["NProbe"] = nprobe
+    return df
 
 
 def load_build_profiler(path=None):

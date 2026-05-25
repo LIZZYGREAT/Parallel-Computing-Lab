@@ -153,66 +153,64 @@ int main(int argc, char *argv[]) {
     auto test_gt = LoadData<int>(data_path + "DEEP100K.gt.query.100k.top100.bin", test_number, test_gt_d);
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
     
+
     // 测试样本量与 Top-K 设定
     test_number = 20;
     const size_t k = 10;
 
     int n_lists = 1024;
     int M = 16;
-    const bool use_opq = true;
-
+    const bool use_opq = false; 
     std::vector<float> rotated_base;
     const float* base_for_build = base;
+    
     if (use_opq) {
-        std::cerr << "[OPQ] Rotating base vectors before IVF-PQ build...\n";
         rotated_base.resize(base_number * vecdim);
         opq_rotate_batch(base, rotated_base.data(), base_number, static_cast<int>(vecdim));
-        base_for_build = rotated_base.data();
+        base_for_build = rotated_base.data(); 
     }
 
-    IVFPQIndex index(vecdim, n_lists, M);
-    MicroProfiler::reset();
+    IVFPQIndex index(vecdim, n_lists);
+    
+    MicroProfiler::Timer _t_build("Index_Build");
     index.build(base_for_build, base_number);
     MicroProfiler::print_and_save("files/profiler_build.csv");
 
-    // 2. 在线阶段：实例化具体的检索策略
-    ADCSearcher adc_searcher(&index, base_for_build, 20); 
-
     MicroProfiler::reset();
-    SDCSearcher sdc_searcher(&index, base_for_build, 20); 
+    
+    ADCSearcher adc_searcher(&index, base_for_build, 30);
+    MicroProfiler::print_and_save("files/profiler_adc_init.csv");
+    
+    MicroProfiler::reset();
+    SDCSearcher sdc_searcher(&index, base_for_build, 30); 
     MicroProfiler::print_and_save("files/profiler_sdc_init.csv");
 
-    std::ofstream csv_file("files/ivfpq_tradeoff.csv", std::ios::app);
+    const int profile_threads = 4;
+    const int profile_nprobe = 64;
+
+    std::ofstream csv_file("files/ivfpq_query_profile.csv", std::ios::trunc);
     if (csv_file.is_open()) {
         csv_file << "Method,Threads,NProbe,Recall@10,Latency(us)\n";
     }
 
-    std::vector<int> thread_configs = {1, 2, 4, 8}; 
-    std::vector<int> nprobe_configs = {8, 16, 32, 64, 128}; 
+    std::cerr << "\n[System] Query profiling: Threads=" << profile_threads
+              << ", NProbe=" << profile_nprobe << "\n";
 
-    std::cerr << "\n[System] Starting Automated Grid Search Evaluation (IVF-PQ Enabled)...\n";
+    std::cerr << "\n>>> ADC\n";
+    run_evaluation(profile_threads, profile_nprobe, &adc_searcher, test_query, test_gt,
+                   test_number, vecdim, test_gt_d, k, csv_file, "ADC", use_opq);
 
-    for (int t : thread_configs) {
-        for (int probe : nprobe_configs) {
-            std::cerr << "\n>>> Running ADC config: Threads=" << t << ", NProbe=" << probe << "\n";
-            run_evaluation(t, probe, &adc_searcher, test_query, test_gt, 
-                           test_number, vecdim, test_gt_d, k, csv_file, "ADC", use_opq);
-        }
-    }
-
-    for (int t : thread_configs) {
-        for (int probe : nprobe_configs) {
-            std::cerr << "\n>>> Running SDC config: Threads=" << t << ", NProbe=" << probe << "\n";
-            run_evaluation(t, probe, &sdc_searcher, test_query, test_gt, 
-                           test_number, vecdim, test_gt_d, k, csv_file, "SDC", use_opq);
-        }
-    }
+    std::cerr << "\n>>> SDC\n";
+    run_evaluation(profile_threads, profile_nprobe, &sdc_searcher, test_query, test_gt,
+                   test_number, vecdim, test_gt_d, k, csv_file, "SDC", use_opq);
 
     if (csv_file.is_open()) {
         csv_file.close();
     }
 
-    std::cerr << "\n[System] All evaluations completed. Check files/ivfpq_tradeoff.csv for results.\n";
+    std::cerr << "\n[System] Done. Profiler: files/profiler_detail_*_T"
+              << profile_threads << "_P" << profile_nprobe << ".csv\n";
+    std::cerr << "[System] Plot: python3 viz/run_query_profile.py\n";
 
     delete[] base; 
     delete[] test_query;

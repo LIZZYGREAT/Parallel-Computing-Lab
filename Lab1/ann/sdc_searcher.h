@@ -2,6 +2,7 @@
 #include "searcher.h"
 #include "ivfpq_index.h"
 #include "kmeans.h"
+#include "fast_scan_kernel.h"
 #include "profiler.h"
 #include <omp.h>
 #include <algorithm>
@@ -18,16 +19,16 @@ private:
 public:
     SDCSearcher(const IVFPQIndex* idx, const float* base, int ratio = 10) 
         : index(idx), base_data(base), rerank_ratio(ratio) {
-        center_dist_table.resize(index->M * 256 * 256, 0.0f);
+        center_dist_table.resize(FS_M * FS_K * FS_K, 0.0f);
 
         MicroProfiler::Timer _t("Init_SDC_Table");
         #pragma omp parallel for schedule(static)
-        for (int m = 0; m < index->M; ++m) {
-            for (int i = 0; i < 256; ++i) {
-                for (int j = 0; j < 256; ++j) {
-                    const float* c_i = &index->pq_centroids[m * 256 * index->d_sub + i * index->d_sub];
-                    const float* c_j = &index->pq_centroids[m * 256 * index->d_sub + j * index->d_sub];
-                    center_dist_table[m * 256 * 256 + i * 256 + j] = compute_L2_sqr(c_i, c_j, index->d_sub);
+        for (int m = 0; m < FS_M; ++m) {
+            for (int i = 0; i < FS_K; ++i) {
+                for (int j = 0; j < FS_K; ++j) {
+                    const float* c_i = &index->pq_centroids[m * FS_K * FS_D_SUB + i * FS_D_SUB];
+                    const float* c_j = &index->pq_centroids[m * FS_K * FS_D_SUB + j * FS_D_SUB];
+                    center_dist_table[m * FS_K * FS_K + i * FS_K + j] = compute_L2_sqr(c_i, c_j, FS_D_SUB);
                 }
             }
         }
@@ -66,9 +67,9 @@ public:
                 int list_id = coarse_cands[i].id;
                 const float coarse_dist = coarse_cands[i].dist;
                 const InvertedList& cur_list = index->lists[list_id];
-                if (cur_list.ids.empty()) continue;
+                if (cur_list.total_elements == 0) continue;
 
-                std::vector<uint8_t> query_code(index->M);
+                std::vector<uint8_t> query_code(FS_M);
                 std::vector<float> residual_q(index->d);
                 {
                     MicroProfiler::Timer _t("3_Compute_Residual");
@@ -78,13 +79,13 @@ public:
                 }
                 {
                     MicroProfiler::Timer _t("4_Quantize_Query");
-                    for (int m = 0; m < index->M; ++m) {
+                    for (int m = 0; m < FS_M; ++m) {
                         const float* sub_query = &residual_q[m * index->d_sub];
-                        const float* sub_centers = &index->pq_centroids[m * 256 * index->d_sub];
+                        const float* sub_centers = &index->pq_centroids[m * FS_K * index->d_sub];
                         
                         float min_dist = std::numeric_limits<float>::max();
                         uint8_t best_pq = 0;
-                        for (int k = 0; k < 256; ++k) {
+                        for (int k = 0; k < FS_K; ++k) {
                             float dist = compute_L2_sqr(sub_query, sub_centers + k * index->d_sub, index->d_sub);
                             if (dist < min_dist) {
                                 min_dist = dist;
@@ -95,28 +96,58 @@ public:
                     }
                 }
 
-                size_t list_size = cur_list.ids.size();
-                const uint8_t* codes = cur_list.codes.data();
-                const uint32_t* ids = cur_list.ids.data();
+                alignas(64) float lut_f[FS_M * 16];
+                float min_val = std::numeric_limits<float>::max();
+                float max_val = std::numeric_limits<float>::lowest();
+                
+                {
+                    MicroProfiler::Timer _t("4.5_Build_LUT");
+                    for (int m = 0; m < FS_M; ++m) {
+                        uint8_t q_code = query_code[m];
+                        for (int k = 0; k < FS_K; ++k) {
+                            // 通过查阅预计算的 SDC 距离表获取具体距离
+                            float dist = center_dist_table[m * FS_K * FS_K + q_code * FS_K + k];
+                            lut_f[m * 16 + k] = dist;
+                            min_val = std::min(min_val, dist);
+                            max_val = std::max(max_val, dist);
+                        }
+                    }
+                }
+
+                float scale = (max_val - min_val) / 255.0f;
+                float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+                float base_dist = coarse_dist + FS_M * min_val;
+
+                alignas(64) uint8_t lut_u8[FS_M * 16];
+                for (int j = 0; j < FS_M * 16; ++j) {
+                    lut_u8[j] = static_cast<uint8_t>((lut_f[j] - min_val) * inv_scale);
+                }
 
                 {
-                    MicroProfiler::Timer _t("5_SDC_Scan");
-                    for (size_t idx = 0; idx < list_size; ++idx) {
-                        float approx_dist = coarse_dist;
-                        const uint8_t* cur_code = codes + idx * index->M;
-                        
-                        #pragma GCC unroll 16
-                        for (int m = 0; m < index->M; ++m) {
-                            approx_dist += center_dist_table[m * 256 * 256 + query_code[m] * 256 + cur_code[m]];
+                    MicroProfiler::Timer _t("5_FastScan_SDC");
+                    const size_t nblocks = cur_list.blocks.size();
+                    for (size_t b = 0; b < nblocks; ++b) {
+                        if (b + 1 < nblocks) {
+                            __builtin_prefetch(&cur_list.blocks[b + 1], 0, 3);
                         }
+                        const FSBlock& block = cur_list.blocks[b];
+                        alignas(32) uint16_t sum_arr[16];
+                        fast_scan_block_accumulate(block, lut_u8, FS_M, sum_arr);
 
-                        if (approx_dist < local_threshold) {
-                            local_topk.push_back({approx_dist, ids[idx]});
-                            if (local_topk.size() >= static_cast<size_t>(rerank_k * 2)) {
-                                std::nth_element(local_topk.begin(), local_topk.begin() + rerank_k, local_topk.end(), cmp_asc);
-                                local_topk.resize(rerank_k);
-                                auto max_it = std::max_element(local_topk.begin(), local_topk.end(), cmp_asc);
-                                local_threshold = max_it->dist;
+                        for (int k = 0; k < 16; ++k) {
+                            uint32_t id = block.ids[k];
+                            if (id == 0xFFFFFFFF) continue; 
+
+                            float approx_dist = base_dist + scale * sum_arr[k];
+
+                            if (approx_dist < local_threshold) {
+                                local_topk.push_back({approx_dist, id});
+                                if (local_topk.size() >= static_cast<size_t>(rerank_k * 2)) {
+                                    std::nth_element(local_topk.begin(), local_topk.begin() + rerank_k, local_topk.end(), cmp_asc);
+                                    local_topk.resize(rerank_k);
+                                    auto max_it = std::max_element(local_topk.begin(), local_topk.end(), cmp_asc);
+                                    local_threshold = max_it->dist;
+                                }
                             }
                         }
                     }

@@ -1,178 +1,178 @@
 #pragma once
-
 #include <vector>
 #include <cstdint>
 #include <cmath>
-#include <omp.h>
 #include <iostream>
-#include <limits>
-#include <cstring>
 #include <algorithm>
-#include <queue>
-
+#include <limits>
+#include <omp.h>
 #include "kmeans.h"
 #include "profiler.h"
 
+constexpr int FS_D = 96;          // 原始向量维度
+constexpr int FS_M = 32;          // 子空间数量
+constexpr int FS_K = 16;          // 聚类中心数
+constexpr int FS_D_SUB = 3;       
+
+struct alignas(64) FSBlock {
+    uint8_t codes[FS_M][16];
+    uint32_t ids[16];
+};
+
 struct InvertedList {
-    std::vector<uint32_t> ids;       // 原始向量 ID
-    std::vector<uint8_t> codes;      // PQ 量化编码，总长度为 ids.size() * M
+    std::vector<FSBlock> blocks;
+    size_t total_elements = 0; 
+};
+
+struct TempVec {
+    uint8_t code[FS_M];
+    uint32_t id;
 };
 
 class IVFPQIndex {
 public:
-    int d;           // 原始向量维度 (例如 96)
-    int n_lists;     // IVF 粗聚类中心数
-    int M;           // PQ 子空间划分数量
-    int d_sub;       // 每个子空间的维度 (d / M)
-    int K_pq = 256;  // PQ 局部聚类中心数 (固定为 256，映射至 uint8_t)
+    int d = FS_D;
+    int n_lists;
+    int M = FS_M;
+    int K = FS_K;
+    int d_sub = FS_D_SUB;
 
-    std::vector<float> ivf_centroids;             // 大小: n_lists * d
-    std::vector<float> pq_centroids;              // 大小: M * 256 * d_sub
-    std::vector<InvertedList> lists;              // 大小: n_lists
+    std::vector<float> ivf_centroids; // n_lists * d
+    std::vector<float> pq_centroids;  // M * K * d_sub
+    std::vector<InvertedList> lists;  // n_lists
 
-    IVFPQIndex(int dim, int num_lists, int m) 
-        : d(dim), n_lists(num_lists), M(m), d_sub(dim / m) {
+    IVFPQIndex(int dim = 96, int nlist = 1024) 
+        : d(dim), n_lists(nlist) {
+        ivf_centroids.resize(n_lists * d);
+        pq_centroids.resize(M * K * d_sub);
         lists.resize(n_lists);
-        ivf_centroids.resize(n_lists * d, 0.0f);
-        pq_centroids.resize(M * K_pq * d_sub, 0.0f);
     }
 
-    void build(const float* base_data, size_t n) {
-        if (n == 0) return;
-        std::cerr << "[IVFPQ] Starting index build for " << n << " vectors.\n";
+    void build(const float* data, size_t n) {
+        std::cerr << "[IVFPQ Build] d=" << d << ", n_lists=" << n_lists 
+                  << ", M=" << M << ", K=" << K << ", d_sub=" << d_sub << "\n";
 
-        // ==========================================
-        // 阶段 1: IVF 粗聚类与残差计算
-        // ==========================================
-        std::cerr << "[IVFPQ] Training IVF centroids...\n";
         {
-            MicroProfiler::Timer _t("Build_1_IVF_KMeans");
-            KMeans ivf_kmeans(d, n_lists);
-            ivf_kmeans.train(base_data, n, 15);
-            std::memcpy(ivf_centroids.data(), ivf_kmeans.centroids.data(), n_lists * d * sizeof(float));
+            MicroProfiler::Timer _t("1_Train_IVF");
+            std::cerr << "Training IVF centroids...\n";
+            KMeans kmeans(d, n_lists);
+            kmeans.train(data, n);
+            ivf_centroids = kmeans.centroids;
         }
 
-        std::vector<int> assign(n, 0);
-        std::vector<float> residuals(n * d, 0.0f);
+        std::vector<int> assign(n);
+        std::vector<float> residuals(n * d);
 
-        std::cerr << "[IVFPQ] Computing residuals...\n";
         {
-            MicroProfiler::Timer _t("Build_2_IVF_Assign");
+            MicroProfiler::Timer _t("2_Compute_Residuals");
+            std::cerr << "Computing residuals...\n";
             #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < n; ++i) {
-                const float* current_data = &base_data[i * d];
                 float min_dist = std::numeric_limits<float>::max();
                 int best_c = 0;
-
                 for (int c = 0; c < n_lists; ++c) {
-                    float dist = compute_L2_sqr(current_data, &ivf_centroids[c * d], d);
+                    float dist = compute_L2_sqr(data + i * d, &ivf_centroids[c * d], d);
                     if (dist < min_dist) {
                         min_dist = dist;
                         best_c = c;
                     }
                 }
                 assign[i] = best_c;
-
                 for (int j = 0; j < d; ++j) {
-                    residuals[i * d + j] = current_data[j] - ivf_centroids[best_c * d + j];
-                }
-            }
-        }
-
-        // ==========================================
-        // 阶段 2: PQ 子空间训练
-        // ==========================================
-        std::cerr << "[IVFPQ] Training PQ sub-quantizers...\n";
-        std::vector<std::vector<float>> sub_train_data(M, std::vector<float>(n * d_sub));
-        
-        {
-            MicroProfiler::Timer _t("Build_3_PQ_Reorder");
-            #pragma omp parallel for schedule(static)
-            for (size_t i = 0; i < n; ++i) {
-                for (int m = 0; m < M; ++m) {
-                    for (int j = 0; j < d_sub; ++j) {
-                        sub_train_data[m][i * d_sub + j] = residuals[i * d + m * d_sub + j];
-                    }
+                    residuals[i * d + j] = data[i * d + j] - ivf_centroids[best_c * d + j];
                 }
             }
         }
 
         {
-            MicroProfiler::Timer _t("Build_4_PQ_KMeans");
+            MicroProfiler::Timer _t("3_Train_PQ");
+            std::cerr << "Training PQ centroids...\n";
             #pragma omp parallel for schedule(dynamic)
             for (int m = 0; m < M; ++m) {
-                KMeans pq_km(d_sub, K_pq);
-                pq_km.train(sub_train_data[m].data(), n, 20);
-                std::memcpy(&pq_centroids[m * K_pq * d_sub], pq_km.centroids.data(), K_pq * d_sub * sizeof(float));
+                std::vector<float> sub_data(n * d_sub);
+                for (size_t i = 0; i < n; ++i) {
+                    for (int j = 0; j < d_sub; ++j) {
+                        sub_data[i * d_sub + j] = residuals[i * d + m * d_sub + j];
+                    }
+                }
+                KMeans kmeans(d_sub, K);
+                kmeans.train(sub_data.data(), n);
+                for (int i = 0; i < K * d_sub; ++i) {
+                    pq_centroids[m * K * d_sub + i] = kmeans.centroids[i];
+                }
             }
         }
 
-        // ==========================================
-        // 阶段 3: 量化编码与倒排桶并行填充
-        // ==========================================
-        std::cerr << "[IVFPQ] Quantizing and populating inverted lists...\n";
         int num_threads = omp_get_max_threads();
-        std::vector<std::vector<InvertedList>> local_lists(num_threads, std::vector<InvertedList>(n_lists));
+        std::vector<std::vector<std::vector<TempVec>>> thread_local_lists(num_threads, std::vector<std::vector<TempVec>>(n_lists));
 
         {
-            MicroProfiler::Timer _t("Build_5_Encode");
+            MicroProfiler::Timer _t("4_Encode_PQ");
+            std::cerr << "Encoding PQ residuals...\n";
             #pragma omp parallel
             {
                 int tid = omp_get_thread_num();
-                std::vector<uint8_t> local_code(M);
-
                 #pragma omp for schedule(static)
                 for (size_t i = 0; i < n; ++i) {
-                    int list_idx = assign[i];
-                    const float* res_vec = &residuals[i * d];
-
+                    TempVec tv;
+                    tv.id = i;
                     for (int m = 0; m < M; ++m) {
-                        const float* sub_res = res_vec + m * d_sub;
-                        const float* sub_centroids = &pq_centroids[m * K_pq * d_sub];
+                        const float* sub_res = &residuals[i * d + m * d_sub];
+                        const float* sub_cents = &pq_centroids[m * K * d_sub];
                         
                         float min_dist = std::numeric_limits<float>::max();
-                        uint8_t best_pq = 0;
-
-                        for (int k = 0; k < K_pq; ++k) {
-                            float dist = compute_L2_sqr(sub_res, sub_centroids + k * d_sub, d_sub);
+                        uint8_t best_k = 0;
+                        for (int k = 0; k < K; ++k) {
+                            float dist = compute_L2_sqr(sub_res, sub_cents + k * d_sub, d_sub);
                             if (dist < min_dist) {
                                 min_dist = dist;
-                                best_pq = static_cast<uint8_t>(k);
+                                best_k = static_cast<uint8_t>(k);
                             }
                         }
-                        local_code[m] = best_pq;
+                        tv.code[m] = best_k;
                     }
-
-                    local_lists[tid][list_idx].ids.push_back(static_cast<uint32_t>(i));
-                    local_lists[tid][list_idx].codes.insert(
-                        local_lists[tid][list_idx].codes.end(),
-                        local_code.begin(), local_code.end()
-                    );
+                    thread_local_lists[tid][assign[i]].push_back(tv);
                 }
             }
         }
 
         {
-            MicroProfiler::Timer _t("Build_6_List_Merge");
+            MicroProfiler::Timer _t("5_Interleave_Blocks");
+            std::cerr << "Interleaving memory for FastScan...\n";
+            #pragma omp parallel for schedule(dynamic)
             for (int c = 0; c < n_lists; ++c) {
-                size_t total_ids = 0;
-                size_t total_codes = 0;
+                std::vector<TempVec> merged_list;
                 for (int t = 0; t < num_threads; ++t) {
-                    total_ids += local_lists[t][c].ids.size();
-                    total_codes += local_lists[t][c].codes.size();
+                    merged_list.insert(merged_list.end(), thread_local_lists[t][c].begin(), thread_local_lists[t][c].end());
                 }
 
-                lists[c].ids.reserve(total_ids);
-                lists[c].codes.reserve(total_codes);
+                size_t num = merged_list.size();
+                lists[c].total_elements = num;
+                
+                size_t num_blocks = (num + 15) / 16;
+                lists[c].blocks.resize(num_blocks);
 
-                for (int t = 0; t < num_threads; ++t) {
-                    lists[c].ids.insert(lists[c].ids.end(), local_lists[t][c].ids.begin(), local_lists[t][c].ids.end());
-                    lists[c].codes.insert(lists[c].codes.end(), local_lists[t][c].codes.begin(), local_lists[t][c].codes.end());
+                for (size_t b = 0; b < num_blocks; ++b) {
+                    FSBlock& block = lists[c].blocks[b];
+                    for (int k = 0; k < 16; ++k) {
+                        size_t idx = b * 16 + k;
+                        if (idx < num) {
+                            // 填充真实数据
+                            block.ids[k] = merged_list[idx].id;
+                            for (int m = 0; m < M; ++m) {
+                                block.codes[m][k] = merged_list[idx].code[m];
+                            }
+                        } else {
+                            // Padding 越界填充 (Dummy)
+                            block.ids[k] = 0xFFFFFFFF; 
+                            for (int m = 0; m < M; ++m) {
+                                block.codes[m][k] = 0;     
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        std::cerr << "[IVFPQ] Index build completed.\n";
+        std::cerr << "[IVFPQ Build] Done.\n";
     }
-
 };

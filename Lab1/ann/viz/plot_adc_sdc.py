@@ -5,7 +5,7 @@ import pandas as pd
 from data_loader import load_tradeoff, load_profiler_details, ensure_fig_dir, ADC_STAGES, SDC_STAGES
 
 plt.rcParams["axes.unicode_minus"] = False
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "WenQuanYi Micro Hei", "SimHei", "Arial Unicode MS"]
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
 
 
 def plot_latency_recall(tradeoff=None, out_dir=None):
@@ -27,7 +27,7 @@ def plot_latency_recall(tradeoff=None, out_dir=None):
             )
     axes[0].set_xlabel("Recall@10")
     axes[0].set_ylabel("Latency (us)")
-    axes[0].set_title("Recall-Latency 权衡曲线")
+    axes[0].set_title("Recall-Latency Trade-off")
     axes[0].grid(True, linestyle="--", alpha=0.5)
     axes[0].legend(fontsize=7, ncol=2)
 
@@ -43,7 +43,7 @@ def plot_latency_recall(tradeoff=None, out_dir=None):
     axes[1].set_xticklabels([str(p) for p in nprobes])
     axes[1].set_xlabel("NProbe")
     axes[1].set_ylabel("Latency (us)")
-    axes[1].set_title(f"ADC vs SDC 延迟对比 (T={t_fix})")
+    axes[1].set_title(f"ADC vs SDC Latency (T={t_fix})")
     axes[1].legend()
     axes[1].grid(axis="y", linestyle="--", alpha=0.5)
 
@@ -72,8 +72,8 @@ def plot_adc_sdc_ratio(tradeoff=None, out_dir=None):
         ax.plot(nprobes, ys, "o-", linewidth=2, label=f"T={t}")
     ax.axhline(1.0, color="gray", linestyle="--", alpha=0.6)
     ax.set_xlabel("NProbe")
-    ax.set_ylabel("SDC延迟 / ADC延迟")
-    ax.set_title("ADC vs SDC 相对延迟 (<1 表示 SDC 更快)")
+    ax.set_ylabel("SDC Latency / ADC Latency")
+    ax.set_title("ADC vs SDC Relative Latency (<1 means SDC faster)")
     ax.grid(True, linestyle="--", alpha=0.5)
     ax.legend()
     plt.tight_layout()
@@ -100,7 +100,7 @@ def plot_stage_compare(profiler=None, threads=4, nprobe=32, out_dir=None):
     fig, ax = plt.subplots(figsize=(11, 6), dpi=150)
     groups = []
     vals = []
-    for method, stages, scan in [("ADC", ADC_STAGES, "5_ADC_Scan"), ("SDC", SDC_STAGES, "5_SDC_Scan")]:
+    for method, stages, scan in [("ADC", ADC_STAGES, "5_FastScan_ADC"), ("SDC", SDC_STAGES, "5_FastScan_SDC")]:
         sub = prof[(prof["Method"] == method) & (prof["Threads"] == threads) & (prof["NProbe"] == nprobe)]
         if sub.empty:
             continue
@@ -109,7 +109,7 @@ def plot_stage_compare(profiler=None, threads=4, nprobe=32, out_dir=None):
         scan_v = float(row.get(scan, 0))
         coarse = float(row.get("1_Coarse_Dist", 0)) + float(row.get("2_Coarse_Sort", 0))
         other = float(row.sum()) - lut_q - scan_v - coarse
-        groups.extend([f"{method}\n粗排", f"{method}\n量化/LUT", f"{method}\n扫描", f"{method}\n其他"])
+        groups.extend([f"{method}\nCoarse", f"{method}\nLUT/Quant", f"{method}\nScan", f"{method}\nOther"])
         vals.extend([coarse, lut_q, scan_v, other])
 
     x = np.arange(len(vals))
@@ -117,8 +117,8 @@ def plot_stage_compare(profiler=None, threads=4, nprobe=32, out_dir=None):
     ax.bar(x, vals, color=colors[: len(vals)])
     ax.set_xticks(x)
     ax.set_xticklabels(groups, fontsize=8)
-    ax.set_ylabel("平均耗时 (us/query)")
-    ax.set_title(f"ADC vs SDC 主要阶段耗时 (T={threads}, nprobe={nprobe})")
+    ax.set_ylabel("Avg Time (us/query)")
+    ax.set_title(f"ADC vs SDC Stage Latency (T={threads}, nprobe={nprobe})")
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     plt.tight_layout()
     out = os.path.join(out_dir, f"adc_sdc_stages_T{threads}_P{nprobe}.png")
