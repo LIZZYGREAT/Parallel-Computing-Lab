@@ -6,15 +6,25 @@
 #include <omp.h>
 #include <algorithm>
 #include <limits>
+#include <vector>
 
 class ADCSearcher : public BaseSearcher {
 private:
     const IVFPQIndex* index;
+    const float* base_data;
+    int rerank_ratio;
 
 public:
-    ADCSearcher(const IVFPQIndex* idx) : index(idx) {}
+    ADCSearcher(const IVFPQIndex* idx, const float* base, int ratio = 10) 
+        : index(idx), base_data(base), rerank_ratio(ratio) {}
 
     std::priority_queue<Candidate> search(const float* query, int top_k, int nprobe) override {
+        int rerank_k = top_k * rerank_ratio;
+
+        auto cmp_asc = [](const Candidate& a, const Candidate& b) {
+            return a.dist < b.dist;
+        };
+
         std::vector<Candidate> coarse_cands(index->n_lists);
         {
             MicroProfiler::Timer _t("1_Coarse_Dist");
@@ -25,7 +35,7 @@ public:
         }
         {
             MicroProfiler::Timer _t("2_Coarse_Sort");
-            std::partial_sort(coarse_cands.begin(), coarse_cands.begin() + nprobe, coarse_cands.end());
+            std::partial_sort(coarse_cands.begin(), coarse_cands.begin() + nprobe, coarse_cands.end(), cmp_asc);
         }
         
         std::vector<Candidate> global_topk;
@@ -33,7 +43,7 @@ public:
         #pragma omp parallel
         {
             std::vector<Candidate> local_topk;
-            local_topk.reserve(top_k * 2);
+            local_topk.reserve(rerank_k * 2);
             float local_threshold = std::numeric_limits<float>::max();
 
             #pragma omp for schedule(dynamic)
@@ -79,10 +89,10 @@ public:
 
                         if (approx_dist < local_threshold) {
                             local_topk.push_back({approx_dist, ids[idx]});
-                            if (local_topk.size() >= static_cast<size_t>(top_k * 2)) {
-                                std::nth_element(local_topk.begin(), local_topk.begin() + top_k, local_topk.end());
-                                local_topk.resize(top_k);
-                                auto max_it = std::max_element(local_topk.begin(), local_topk.end());
+                            if (local_topk.size() >= static_cast<size_t>(rerank_k * 2)) {
+                                std::nth_element(local_topk.begin(), local_topk.begin() + rerank_k, local_topk.end(), cmp_asc);
+                                local_topk.resize(rerank_k);
+                                auto max_it = std::max_element(local_topk.begin(), local_topk.end(), cmp_asc);
                                 local_threshold = max_it->dist;
                             }
                         }
@@ -92,9 +102,9 @@ public:
 
             {
                 MicroProfiler::Timer _t("6_Local_TopK_Trim");
-                if (local_topk.size() > static_cast<size_t>(top_k)) {
-                    std::nth_element(local_topk.begin(), local_topk.begin() + top_k, local_topk.end());
-                    local_topk.resize(top_k);
+                if (local_topk.size() > static_cast<size_t>(rerank_k)) {
+                    std::nth_element(local_topk.begin(), local_topk.begin() + rerank_k, local_topk.end(), cmp_asc);
+                    local_topk.resize(rerank_k);
                 }
             }
 
@@ -109,12 +119,26 @@ public:
 
         {
             MicroProfiler::Timer _t("8_Global_Merge");
-            if (global_topk.size() > static_cast<size_t>(top_k)) {
-                std::nth_element(global_topk.begin(), global_topk.begin() + top_k, global_topk.end());
-                global_topk.resize(top_k);
+            if (global_topk.size() > static_cast<size_t>(rerank_k)) {
+                std::nth_element(global_topk.begin(), global_topk.begin() + rerank_k, global_topk.end(), cmp_asc);
+                global_topk.resize(rerank_k);
             }
         }
         
+        {
+            MicroProfiler::Timer _t("8.5_Re_Rank");
+            for (auto& cand : global_topk) {
+                uint32_t id = cand.id;
+                const float* exact_vec = base_data + id * index->d;
+                cand.dist = compute_L2_sqr(query, exact_vec, index->d);
+            }
+            
+            if (global_topk.size() > static_cast<size_t>(top_k)) {
+                std::nth_element(global_topk.begin(), global_topk.begin() + top_k, global_topk.end(), cmp_asc);
+                global_topk.resize(top_k);
+            }
+        }
+
         std::priority_queue<Candidate> final_pq;
         {
             MicroProfiler::Timer _t("9_Build_Result");

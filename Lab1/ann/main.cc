@@ -176,10 +176,10 @@ int main(int argc, char *argv[]) {
     MicroProfiler::print_and_save("files/profiler_build.csv");
 
     // 2. 在线阶段：实例化具体的检索策略
-    ADCSearcher adc_searcher(&index);
+    ADCSearcher adc_searcher(&index, base_for_build, 20); 
 
     MicroProfiler::reset();
-    SDCSearcher sdc_searcher(&index);
+    SDCSearcher sdc_searcher(&index, base_for_build, 20); 
     MicroProfiler::print_and_save("files/profiler_sdc_init.csv");
 
     std::ofstream csv_file("files/ivfpq_tradeoff.csv", std::ios::app);
