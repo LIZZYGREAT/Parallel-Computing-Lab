@@ -144,6 +144,59 @@ void run_evaluation(int thread_count, int nprobe, BaseSearcher* searcher,
     }
 }
 
+static void run_query_profile(
+    int test_number, size_t vecdim, size_t test_gt_d, size_t k,
+    const float* test_query, const int* test_gt,
+    ADCSearcher& adc_searcher, SDCSearcher& sdc_searcher, bool use_opq) {
+    const int threads = 4;
+    const int nprobe = 64;
+
+    std::ofstream csv("files/ivfpq_query_profile.csv", std::ios::trunc);
+    if (csv.is_open()) {
+        csv << "Method,Threads,NProbe,Recall@10,Latency(us)\n";
+    }
+
+    std::cerr << "\n[Mode: profile] T=" << threads << ", nprobe=" << nprobe << "\n";
+    std::cerr << "\n>>> ADC\n";
+    run_evaluation(threads, nprobe, &adc_searcher, test_query, test_gt,
+                   test_number, vecdim, test_gt_d, k, csv, "ADC", use_opq);
+    std::cerr << "\n>>> SDC\n";
+    run_evaluation(threads, nprobe, &sdc_searcher, test_query, test_gt,
+                   test_number, vecdim, test_gt_d, k, csv, "SDC", use_opq);
+
+    std::cerr << "\n[System] Profiler: files/profiler_detail_*_T"
+              << threads << "_P" << nprobe << ".csv\n";
+    std::cerr << "[System] Plot: python3 viz/run_query_profile.py\n";
+}
+
+static void run_param_grid(
+    int test_number, size_t vecdim, size_t test_gt_d, size_t k,
+    const float* test_query, const int* test_gt,
+    ADCSearcher& adc_searcher, SDCSearcher& sdc_searcher, bool use_opq) {
+    const int thread_list[] = {1, 2, 4, 8};
+    const int nprobe_list[] = {8, 16, 32, 64, 128};
+
+    std::ofstream csv("files/ivfpq_tradeoff.csv", std::ios::trunc);
+    if (csv.is_open()) {
+        csv << "Method,Threads,NProbe,Recall@10,Latency(us)\n";
+    }
+
+    std::cerr << "\n[Mode: grid] sweep threads & nprobe\n";
+    for (int t : thread_list) {
+        for (int p : nprobe_list) {
+            std::cerr << "\n>>> ADC Threads=" << t << " NProbe=" << p << "\n";
+            run_evaluation(t, p, &adc_searcher, test_query, test_gt,
+                           test_number, vecdim, test_gt_d, k, csv, "ADC", use_opq);
+            std::cerr << "\n>>> SDC Threads=" << t << " NProbe=" << p << "\n";
+            run_evaluation(t, p, &sdc_searcher, test_query, test_gt,
+                           test_number, vecdim, test_gt_d, k, csv, "SDC", use_opq);
+        }
+    }
+
+    std::cerr << "\n[System] Results: files/ivfpq_tradeoff.csv\n";
+    std::cerr << "[System] Plot: python3 viz/run_all.py\n";
+}
+
 int main(int argc, char *argv[]) {
     size_t test_number = 0, base_number = 0;
     size_t test_gt_d = 0, vecdim = 0;
@@ -185,32 +238,29 @@ int main(int argc, char *argv[]) {
     SDCSearcher sdc_searcher(&index, base_for_build, 30); 
     MicroProfiler::print_and_save("files/profiler_sdc_init.csv");
 
-    const int profile_threads = 4;
-    const int profile_nprobe = 64;
-
-    std::ofstream csv_file("files/ivfpq_query_profile.csv", std::ios::trunc);
-    if (csv_file.is_open()) {
-        csv_file << "Method,Threads,NProbe,Recall@10,Latency(us)\n";
+    bool profile_mode = false;
+    if (argc >= 2) {
+        std::string mode(argv[1]);
+        if (mode == "profile") {
+            profile_mode = true;
+        } else if (mode != "grid") {
+            std::cerr << "Usage: " << argv[0] << " [grid|profile]\n"
+                      << "  grid    - sweep threads/nprobe (default)\n"
+                      << "  profile - T=4, nprobe=64 query stage only\n";
+            delete[] base;
+            delete[] test_query;
+            delete[] test_gt;
+            return 1;
+        }
     }
 
-    std::cerr << "\n[System] Query profiling: Threads=" << profile_threads
-              << ", NProbe=" << profile_nprobe << "\n";
-
-    std::cerr << "\n>>> ADC\n";
-    run_evaluation(profile_threads, profile_nprobe, &adc_searcher, test_query, test_gt,
-                   test_number, vecdim, test_gt_d, k, csv_file, "ADC", use_opq);
-
-    std::cerr << "\n>>> SDC\n";
-    run_evaluation(profile_threads, profile_nprobe, &sdc_searcher, test_query, test_gt,
-                   test_number, vecdim, test_gt_d, k, csv_file, "SDC", use_opq);
-
-    if (csv_file.is_open()) {
-        csv_file.close();
+    if (profile_mode) {
+        run_query_profile(test_number, vecdim, test_gt_d, k,
+                          test_query, test_gt, adc_searcher, sdc_searcher, use_opq);
+    } else {
+        run_param_grid(test_number, vecdim, test_gt_d, k,
+                       test_query, test_gt, adc_searcher, sdc_searcher, use_opq);
     }
-
-    std::cerr << "\n[System] Done. Profiler: files/profiler_detail_*_T"
-              << profile_threads << "_P" << profile_nprobe << ".csv\n";
-    std::cerr << "[System] Plot: python3 viz/run_query_profile.py\n";
 
     delete[] base; 
     delete[] test_query;

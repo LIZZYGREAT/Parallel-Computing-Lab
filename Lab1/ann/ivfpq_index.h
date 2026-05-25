@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <cstring>
 #include <cstdint>
 #include <cmath>
 #include <iostream>
@@ -8,6 +9,7 @@
 #include <omp.h>
 #include "kmeans.h"
 #include "profiler.h"
+#include "aligned_alloc.h"
 
 constexpr int FS_D = 96;          // 原始向量维度
 constexpr int FS_M = 32;          // 子空间数量
@@ -37,8 +39,8 @@ public:
     int K = FS_K;
     int d_sub = FS_D_SUB;
 
-    std::vector<float> ivf_centroids; // n_lists * d
-    std::vector<float> pq_centroids;  // M * K * d_sub
+    AlignedBuffer<float> ivf_centroids;
+    AlignedBuffer<float> pq_centroids;
     std::vector<InvertedList> lists;  // n_lists
 
     IVFPQIndex(int dim = 96, int nlist = 1024) 
@@ -57,7 +59,7 @@ public:
             std::cerr << "Training IVF centroids...\n";
             KMeans kmeans(d, n_lists);
             kmeans.train(data, n);
-            ivf_centroids = kmeans.centroids;
+            ivf_centroids.assign(kmeans.centroids);
         }
 
         std::vector<int> assign(n);
@@ -97,9 +99,8 @@ public:
                 }
                 KMeans kmeans(d_sub, K);
                 kmeans.train(sub_data.data(), n);
-                for (int i = 0; i < K * d_sub; ++i) {
-                    pq_centroids[m * K * d_sub + i] = kmeans.centroids[i];
-                }
+                std::memcpy(pq_centroids.data() + m * K * d_sub,
+                            kmeans.centroids.data(), K * d_sub * sizeof(float));
             }
         }
 
@@ -118,7 +119,7 @@ public:
                     tv.id = i;
                     for (int m = 0; m < M; ++m) {
                         const float* sub_res = &residuals[i * d + m * d_sub];
-                        const float* sub_cents = &pq_centroids[m * K * d_sub];
+                        const float* sub_cents = pq_centroids.data() + m * K * d_sub;
                         
                         float min_dist = std::numeric_limits<float>::max();
                         uint8_t best_k = 0;

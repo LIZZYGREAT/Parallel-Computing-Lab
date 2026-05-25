@@ -3,6 +3,7 @@
 #include "ivfpq_index.h"
 #include "kmeans.h"
 #include "fast_scan_kernel.h"
+#include "pq_distance.h"
 #include "profiler.h"
 #include <omp.h>
 #include <algorithm>
@@ -55,40 +56,31 @@ public:
                 if (cur_list.total_elements == 0) continue;
 
                 alignas(64) float lut_f[FS_M * 16];
-                std::vector<float> residual_q(index->d);
+                alignas(64) float residual_q[FS_D];
                 {
                     MicroProfiler::Timer _t("3_Compute_Residual");
-                    for (int j = 0; j < index->d; ++j) {
-                        residual_q[j] = query[j] - index->ivf_centroids[list_id * index->d + j];
-                    }
-                }
-                
-                float min_val = std::numeric_limits<float>::max();
-                float max_val = std::numeric_limits<float>::lowest();
-                
-                {
-                    MicroProfiler::Timer _t("4_Build_LUT");
-                    for (int m = 0; m < FS_M; ++m) {
-                        const float* sub_query = &residual_q[m * index->d_sub];
-                        const float* sub_centers = &index->pq_centroids[m * FS_K * index->d_sub];
-                        for (int k = 0; k < FS_K; ++k) {
-                            float dist = compute_L2_sqr(sub_query, sub_centers + k * index->d_sub, index->d_sub);
-                            lut_f[m * 16 + k] = dist;
-                            min_val = std::min(min_val, dist);
-                            max_val = std::max(max_val, dist);
+                    if (index->d == FS_D) {
+                        residual_sub_d96(query, &index->ivf_centroids[list_id * index->d], residual_q);
+                    } else {
+                        for (int j = 0; j < index->d; ++j) {
+                            residual_q[j] = query[j] - index->ivf_centroids[list_id * index->d + j];
                         }
                     }
                 }
 
-                // 计算 8-bit 量化的比例因子
+                float min_val, max_val;
+                {
+                    MicroProfiler::Timer _t("4_Build_LUT");
+                    pq_build_adc_lut(residual_q, FS_M, index->d_sub,
+                                     index->pq_centroids.data(), lut_f, min_val, max_val);
+                }
+
                 float scale = (max_val - min_val) / 255.0f;
                 float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
                 float base_dist = coarse_dist + FS_M * min_val;
 
                 alignas(64) uint8_t lut_u8[FS_M * 16];
-                for (int j = 0; j < FS_M * 16; ++j) {
-                    lut_u8[j] = static_cast<uint8_t>((lut_f[j] - min_val) * inv_scale);
-                }
+                lut_float_to_u8(lut_f, FS_M * 16, min_val, inv_scale, lut_u8);
 
                 {
                     MicroProfiler::Timer _t("5_FastScan_ADC");

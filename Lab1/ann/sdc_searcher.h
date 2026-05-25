@@ -3,6 +3,7 @@
 #include "ivfpq_index.h"
 #include "kmeans.h"
 #include "fast_scan_kernel.h"
+#include "pq_distance.h"
 #include "profiler.h"
 #include <omp.h>
 #include <algorithm>
@@ -69,48 +70,36 @@ public:
                 const InvertedList& cur_list = index->lists[list_id];
                 if (cur_list.total_elements == 0) continue;
 
-                std::vector<uint8_t> query_code(FS_M);
-                std::vector<float> residual_q(index->d);
+                alignas(64) uint8_t query_code[FS_M];
+                alignas(64) float residual_q[FS_D];
                 {
                     MicroProfiler::Timer _t("3_Compute_Residual");
-                    for (int j = 0; j < index->d; ++j) {
-                        residual_q[j] = query[j] - index->ivf_centroids[list_id * index->d + j];
+                    if (index->d == FS_D) {
+                        residual_sub_d96(query, &index->ivf_centroids[list_id * index->d], residual_q);
+                    } else {
+                        for (int j = 0; j < index->d; ++j) {
+                            residual_q[j] = query[j] - index->ivf_centroids[list_id * index->d + j];
+                        }
                     }
                 }
                 {
                     MicroProfiler::Timer _t("4_Quantize_Query");
-                    for (int m = 0; m < FS_M; ++m) {
-                        const float* sub_query = &residual_q[m * index->d_sub];
-                        const float* sub_centers = &index->pq_centroids[m * FS_K * index->d_sub];
-                        
-                        float min_dist = std::numeric_limits<float>::max();
-                        uint8_t best_pq = 0;
-                        for (int k = 0; k < FS_K; ++k) {
-                            float dist = compute_L2_sqr(sub_query, sub_centers + k * index->d_sub, index->d_sub);
-                            if (dist < min_dist) {
-                                min_dist = dist;
-                                best_pq = static_cast<uint8_t>(k);
-                            }
-                        }
-                        query_code[m] = best_pq;
-                    }
+                    pq_quantize_residual(residual_q, FS_M, index->d_sub,
+                                         index->pq_centroids.data(), query_code);
                 }
 
                 alignas(64) float lut_f[FS_M * 16];
-                float min_val = std::numeric_limits<float>::max();
-                float max_val = std::numeric_limits<float>::lowest();
-                
+                float min_val, max_val;
                 {
                     MicroProfiler::Timer _t("4.5_Build_LUT");
+                    min_val = std::numeric_limits<float>::max();
+                    max_val = std::numeric_limits<float>::lowest();
                     for (int m = 0; m < FS_M; ++m) {
-                        uint8_t q_code = query_code[m];
-                        for (int k = 0; k < FS_K; ++k) {
-                            // 通过查阅预计算的 SDC 距离表获取具体距离
-                            float dist = center_dist_table[m * FS_K * FS_K + q_code * FS_K + k];
-                            lut_f[m * 16 + k] = dist;
-                            min_val = std::min(min_val, dist);
-                            max_val = std::max(max_val, dist);
-                        }
+                        const float* row = &center_dist_table[m * FS_K * FS_K + query_code[m] * FS_K];
+                        float row_min, row_max;
+                        sdc_lut_from_table_row(row, &lut_f[m * 16], row_min, row_max);
+                        min_val = min_val < row_min ? min_val : row_min;
+                        max_val = max_val > row_max ? max_val : row_max;
                     }
                 }
 
@@ -119,9 +108,7 @@ public:
                 float base_dist = coarse_dist + FS_M * min_val;
 
                 alignas(64) uint8_t lut_u8[FS_M * 16];
-                for (int j = 0; j < FS_M * 16; ++j) {
-                    lut_u8[j] = static_cast<uint8_t>((lut_f[j] - min_val) * inv_scale);
-                }
+                lut_float_to_u8(lut_f, FS_M * 16, min_val, inv_scale, lut_u8);
 
                 {
                     MicroProfiler::Timer _t("5_FastScan_SDC");
