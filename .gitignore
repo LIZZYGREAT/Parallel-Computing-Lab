@@ -18,3 +18,5 @@ Makefile
 *report
 *figures
 *__pycache__
+*main
+*runs

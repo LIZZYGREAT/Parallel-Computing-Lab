@@ -5,16 +5,20 @@
 #include <iostream>
 #include <algorithm>
 #include <limits>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <omp.h>
 #include "kmeans.h"
 #include "profiler.h"
+#include "simd_l2.h"
 
-constexpr int FS_D = 96;          // 原始向量维度
-constexpr int FS_M = 32;          // 子空间数量
-constexpr int FS_K = 16;          // 聚类中心数
+constexpr int FS_D = 96;          
+constexpr int FS_M = 32;          
+constexpr int FS_K = 16;          
 constexpr int FS_D_SUB = 3;       
 
-struct alignas(64) FSBlock {
+struct alignas(16) FSBlock {
     uint8_t codes[FS_M][16];
     uint32_t ids[16];
 };
@@ -29,6 +33,29 @@ struct TempVec {
     uint32_t id;
 };
 
+template <typename T, std::size_t Alignment>
+struct AlignedAllocator {
+    using value_type = T;
+    AlignedAllocator() noexcept = default;
+    template <typename U> AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+    
+    T* allocate(std::size_t n) {
+        void* ptr = nullptr;
+        if (posix_memalign(&ptr, Alignment, n * sizeof(T)) != 0) {
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(ptr);
+    }
+    
+    void deallocate(T* p, std::size_t) noexcept {
+        free(p);
+    }
+    template <typename U> struct rebind { using other = AlignedAllocator<U, Alignment>; };
+};
+
+template<typename T>
+using AlignedVector = std::vector<T, AlignedAllocator<T, 64>>;
+
 class IVFPQIndex {
 public:
     int d = FS_D;
@@ -37,9 +64,9 @@ public:
     int K = FS_K;
     int d_sub = FS_D_SUB;
 
-    std::vector<float> ivf_centroids; // n_lists * d
-    std::vector<float> pq_centroids;  // M * K * d_sub
-    std::vector<InvertedList> lists;  // n_lists
+    AlignedVector<float> ivf_centroids; 
+    AlignedVector<float> pq_centroids;  
+    std::vector<InvertedList> lists;  
 
     IVFPQIndex(int dim = 96, int nlist = 1024) 
         : d(dim), n_lists(nlist) {
@@ -54,10 +81,9 @@ public:
 
         {
             MicroProfiler::Timer _t("1_Train_IVF");
-            std::cerr << "Training IVF centroids...\n";
-            KMeans kmeans(d, n_lists);
-            kmeans.train(data, n);
-            ivf_centroids = kmeans.centroids;
+            KMeans ivf_km(d, n_lists);
+            ivf_km.train(data, n);
+            std::memcpy(ivf_centroids.data(), ivf_km.centroids.data(), n_lists * d * sizeof(float));
         }
 
         std::vector<int> assign(n);
@@ -65,7 +91,6 @@ public:
 
         {
             MicroProfiler::Timer _t("2_Compute_Residuals");
-            std::cerr << "Computing residuals...\n";
             #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < n; ++i) {
                 float min_dist = std::numeric_limits<float>::max();
@@ -86,7 +111,6 @@ public:
 
         {
             MicroProfiler::Timer _t("3_Train_PQ");
-            std::cerr << "Training PQ centroids...\n";
             #pragma omp parallel for schedule(dynamic)
             for (int m = 0; m < M; ++m) {
                 std::vector<float> sub_data(n * d_sub);
@@ -95,11 +119,9 @@ public:
                         sub_data[i * d_sub + j] = residuals[i * d + m * d_sub + j];
                     }
                 }
-                KMeans kmeans(d_sub, K);
-                kmeans.train(sub_data.data(), n);
-                for (int i = 0; i < K * d_sub; ++i) {
-                    pq_centroids[m * K * d_sub + i] = kmeans.centroids[i];
-                }
+                KMeans pq_km(d_sub, K);
+                pq_km.train(sub_data.data(), n);
+                std::memcpy(&pq_centroids[m * K * d_sub], pq_km.centroids.data(), K * d_sub * sizeof(float));
             }
         }
 
@@ -108,7 +130,6 @@ public:
 
         {
             MicroProfiler::Timer _t("4_Encode_PQ");
-            std::cerr << "Encoding PQ residuals...\n";
             #pragma omp parallel
             {
                 int tid = omp_get_thread_num();
@@ -138,7 +159,6 @@ public:
 
         {
             MicroProfiler::Timer _t("5_Interleave_Blocks");
-            std::cerr << "Interleaving memory for FastScan...\n";
             #pragma omp parallel for schedule(dynamic)
             for (int c = 0; c < n_lists; ++c) {
                 std::vector<TempVec> merged_list;
@@ -157,13 +177,11 @@ public:
                     for (int k = 0; k < 16; ++k) {
                         size_t idx = b * 16 + k;
                         if (idx < num) {
-                            // 填充真实数据
                             block.ids[k] = merged_list[idx].id;
                             for (int m = 0; m < M; ++m) {
                                 block.codes[m][k] = merged_list[idx].code[m];
                             }
                         } else {
-                            // Padding 越界填充 (Dummy)
                             block.ids[k] = 0xFFFFFFFF; 
                             for (int m = 0; m < M; ++m) {
                                 block.codes[m][k] = 0;     

@@ -2,41 +2,32 @@
 #include "searcher.h"
 #include "ivfpq_index.h"
 #include "kmeans.h"
-#include "fast_scan_kernel.h"
 #include "profiler.h"
+#include "simd_l2.h"
+#include "fast_scan_kernel.h"
 #include <omp.h>
 #include <algorithm>
 #include <limits>
 #include <vector>
 
-class SDCSearcher : public BaseSearcher {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+class ADCSearcher : public BaseSearcher {
 private:
     const IVFPQIndex* index;
-    const float* base_data;
-    int rerank_ratio;
-    std::vector<float> center_dist_table;
+    const float* base_data;  
+    int rerank_ratio;        
 
 public:
-    SDCSearcher(const IVFPQIndex* idx, const float* base, int ratio = 10) 
-        : index(idx), base_data(base), rerank_ratio(ratio) {
-        center_dist_table.resize(FS_M * FS_K * FS_K, 0.0f);
-
-        MicroProfiler::Timer _t("Init_SDC_Table");
-        #pragma omp parallel for schedule(static)
-        for (int m = 0; m < FS_M; ++m) {
-            for (int i = 0; i < FS_K; ++i) {
-                for (int j = 0; j < FS_K; ++j) {
-                    const float* c_i = &index->pq_centroids[m * FS_K * FS_D_SUB + i * FS_D_SUB];
-                    const float* c_j = &index->pq_centroids[m * FS_K * FS_D_SUB + j * FS_D_SUB];
-                    center_dist_table[m * FS_K * FS_K + i * FS_K + j] = compute_L2_sqr(c_i, c_j, FS_D_SUB);
-                }
-            }
-        }
-    }
+    ADCSearcher(const IVFPQIndex* idx, const float* base, int ratio = 10) 
+        : index(idx), base_data(base), rerank_ratio(ratio) {}
 
     std::priority_queue<Candidate> search(const float* query, int top_k, int nprobe) override {
         int rerank_k = top_k * rerank_ratio;
-
         auto cmp_asc = [](const Candidate& a, const Candidate& b) {
             return a.dist < b.dist;
         };
@@ -69,7 +60,7 @@ public:
                 const InvertedList& cur_list = index->lists[list_id];
                 if (cur_list.total_elements == 0) continue;
 
-                std::vector<uint8_t> query_code(FS_M);
+                alignas(64) float lut_f[FS_M * 16];
                 std::vector<float> residual_q(index->d);
                 {
                     MicroProfiler::Timer _t("3_Compute_Residual");
@@ -77,36 +68,17 @@ public:
                         residual_q[j] = query[j] - index->ivf_centroids[list_id * index->d + j];
                     }
                 }
-                {
-                    MicroProfiler::Timer _t("4_Quantize_Query");
-                    for (int m = 0; m < FS_M; ++m) {
-                        const float* sub_query = &residual_q[m * index->d_sub];
-                        const float* sub_centers = &index->pq_centroids[m * FS_K * index->d_sub];
-                        
-                        float min_dist = std::numeric_limits<float>::max();
-                        uint8_t best_pq = 0;
-                        for (int k = 0; k < FS_K; ++k) {
-                            float dist = compute_L2_sqr(sub_query, sub_centers + k * index->d_sub, index->d_sub);
-                            if (dist < min_dist) {
-                                min_dist = dist;
-                                best_pq = static_cast<uint8_t>(k);
-                            }
-                        }
-                        query_code[m] = best_pq;
-                    }
-                }
-
-                alignas(64) float lut_f[FS_M * 16];
+                
                 float min_val = std::numeric_limits<float>::max();
                 float max_val = std::numeric_limits<float>::lowest();
                 
                 {
-                    MicroProfiler::Timer _t("4.5_Build_LUT");
+                    MicroProfiler::Timer _t("4_Build_LUT");
                     for (int m = 0; m < FS_M; ++m) {
-                        uint8_t q_code = query_code[m];
+                        const float* sub_query = &residual_q[m * index->d_sub];
+                        const float* sub_centers = &index->pq_centroids[m * FS_K * index->d_sub];
                         for (int k = 0; k < FS_K; ++k) {
-                            // 通过查阅预计算的 SDC 距离表获取具体距离
-                            float dist = center_dist_table[m * FS_K * FS_K + q_code * FS_K + k];
+                            float dist = compute_L2_sqr(sub_query, sub_centers + k * index->d_sub, index->d_sub);
                             lut_f[m * 16 + k] = dist;
                             min_val = std::min(min_val, dist);
                             max_val = std::max(max_val, dist);
@@ -124,12 +96,8 @@ public:
                 }
 
                 {
-                    MicroProfiler::Timer _t("5_FastScan_SDC");
-                    const size_t nblocks = cur_list.blocks.size();
-                    for (size_t b = 0; b < nblocks; ++b) {
-                        if (b + 1 < nblocks) {
-                            __builtin_prefetch(&cur_list.blocks[b + 1], 0, 3);
-                        }
+                    MicroProfiler::Timer _t("5_FastScan_ADC");
+                    for (size_t b = 0; b < cur_list.blocks.size(); ++b) {
                         const FSBlock& block = cur_list.blocks[b];
                         alignas(32) uint16_t sum_arr[16];
                         fast_scan_block_accumulate(block, lut_u8, FS_M, sum_arr);

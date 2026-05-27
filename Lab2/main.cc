@@ -8,8 +8,10 @@
 #include <iomanip>
 #include <sstream>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <stdlib.h> 
 #include <omp.h>
+#include <stdio.h>
 #include <queue>
 #include <ctime>
 
@@ -21,28 +23,23 @@
 
 using namespace std;
 
-// 异步持久化日志记录
-void save_persistent_log(float avg_recall, float avg_latency) {
+std::string make_run_dir(bool use_opq, int n_lists) {
     std::time_t now = std::time(nullptr);
     std::tm* ltm = std::localtime(&now);
-
     std::stringstream ss;
-    ss << "files/result_" 
-       << (1900 + ltm->tm_year) << std::setw(2) << std::setfill('0') << (1 + ltm->tm_mon) 
-       << std::setw(2) << std::setfill('0') << ltm->tm_mday << "_" 
-       << std::setw(2) << std::setfill('0') << ltm->tm_hour 
-       << std::setw(2) << std::setfill('0') << ltm->tm_min << ".log";
-
-    std::ofstream fout(ss.str());
-    if (fout.is_open()) {
-        fout << "Average Recall: " << avg_recall << std::endl;
-        fout << "Average Latency: " << avg_latency << " us" << std::endl;
-        fout << "Timestamp: " << std::asctime(ltm);
-        fout.close();
-        std::cerr << "[System] Result successfully saved to " << ss.str() << std::endl;
-    } else {
-        std::cerr << "[Error] Failed to write to files/ directory! Please check permissions." << std::endl;
-    }
+    ss << "runs/"
+       << (1900 + ltm->tm_year)
+       << std::setw(2) << std::setfill('0') << (1 + ltm->tm_mon)
+       << std::setw(2) << std::setfill('0') << ltm->tm_mday << "_"
+       << std::setw(2) << std::setfill('0') << ltm->tm_hour
+       << std::setw(2) << std::setfill('0') << ltm->tm_min
+       << std::setw(2) << std::setfill('0') << ltm->tm_sec
+       << "_IVFPQ_ADC-SDC_nlist" << n_lists
+       << "_M" << FS_M << "_opq" << (use_opq ? 1 : 0);
+    std::string dir = ss.str();
+    mkdir("runs", 0755);
+    mkdir(dir.c_str(), 0755);
+    return dir;
 }
 
 template<typename T>
@@ -73,11 +70,11 @@ struct SearchResult {
     int64_t latency;
 };
 
-// 评估逻辑：接收 BaseSearcher 接口，解除具体算法强耦合
 void run_evaluation(int thread_count, int nprobe, BaseSearcher* searcher, 
                     const float* test_query, const int* test_gt, 
                     size_t test_number, size_t vecdim, size_t test_gt_d, size_t k,
-                    std::ofstream& csv_file, const std::string& method_name, bool use_opq) {
+                    std::ofstream& csv_file, const std::string& method_name, bool use_opq,
+                    const std::string& out_dir) {
     
     omp_set_num_threads(thread_count);
     MicroProfiler::reset(); 
@@ -134,7 +131,7 @@ void run_evaluation(int thread_count, int nprobe, BaseSearcher* searcher,
               << " | Latency: " << final_latency << " us\n";
 
     std::stringstream profiler_path;
-    profiler_path << "files/profiler_detail_" << method_name
+    profiler_path << out_dir << "/profiler_" << method_name
                   << "_T" << thread_count << "_P" << nprobe << ".csv";
     MicroProfiler::print_and_save(profiler_path.str(), test_number);
               
@@ -153,14 +150,14 @@ int main(int argc, char *argv[]) {
     auto test_gt = LoadData<int>(data_path + "DEEP100K.gt.query.100k.top100.bin", test_number, test_gt_d);
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
     
-
-    // 测试样本量与 Top-K 设定
     test_number = 20;
     const size_t k = 10;
-
     int n_lists = 1024;
-    int M = 16;
+    
     const bool use_opq = false; 
+    std::string out_dir = make_run_dir(use_opq, n_lists);
+    std::cerr << "[System] Output dir: " << out_dir << "\n";
+
     std::vector<float> rotated_base;
     const float* base_for_build = base;
     
@@ -174,43 +171,54 @@ int main(int argc, char *argv[]) {
     
     MicroProfiler::Timer _t_build("Index_Build");
     index.build(base_for_build, base_number);
-    MicroProfiler::print_and_save("files/profiler_build.csv");
+    MicroProfiler::print_and_save(out_dir + "/profiler_build.csv");
 
     MicroProfiler::reset();
     
     ADCSearcher adc_searcher(&index, base_for_build, 30);
-    MicroProfiler::print_and_save("files/profiler_adc_init.csv");
+    MicroProfiler::print_and_save(out_dir + "/profiler_adc_init.csv");
     
     MicroProfiler::reset();
     SDCSearcher sdc_searcher(&index, base_for_build, 30); 
-    MicroProfiler::print_and_save("files/profiler_sdc_init.csv");
+    MicroProfiler::print_and_save(out_dir + "/profiler_sdc_init.csv");
 
-    const int profile_threads = 4;
-    const int profile_nprobe = 64;
+    std::ofstream csv_file(out_dir + "/ivfpq_tradeoff.csv");
+    csv_file << "Method,Threads,NProbe,Recall@10,Latency(us)\n";
 
-    std::ofstream csv_file("files/ivfpq_query_profile.csv", std::ios::trunc);
-    if (csv_file.is_open()) {
-        csv_file << "Method,Threads,NProbe,Recall@10,Latency(us)\n";
+    std::vector<int> thread_configs = {1, 2, 4, 8}; 
+    std::vector<int> nprobe_configs = {8, 16, 32, 64, 128}; 
+
+    std::cerr << "\n[System] Starting Automated Grid Search Evaluation (IVF-PQ Enabled)...\n";
+
+    for (int t : thread_configs) {
+        for (int probe : nprobe_configs) {
+            std::cerr << "\n>>> Running ADC config: Threads=" << t << ", NProbe=" << probe << "\n";
+            run_evaluation(t, probe, &adc_searcher, test_query, test_gt, 
+                           test_number, vecdim, test_gt_d, k, csv_file, "ADC", use_opq, out_dir);
+        }
     }
 
-    std::cerr << "\n[System] Query profiling: Threads=" << profile_threads
-              << ", NProbe=" << profile_nprobe << "\n";
-
-    std::cerr << "\n>>> ADC\n";
-    run_evaluation(profile_threads, profile_nprobe, &adc_searcher, test_query, test_gt,
-                   test_number, vecdim, test_gt_d, k, csv_file, "ADC", use_opq);
-
-    std::cerr << "\n>>> SDC\n";
-    run_evaluation(profile_threads, profile_nprobe, &sdc_searcher, test_query, test_gt,
-                   test_number, vecdim, test_gt_d, k, csv_file, "SDC", use_opq);
-
-    if (csv_file.is_open()) {
-        csv_file.close();
+    for (int t : thread_configs) {
+        for (int probe : nprobe_configs) {
+            std::cerr << "\n>>> Running SDC config: Threads=" << t << ", NProbe=" << probe << "\n";
+            run_evaluation(t, probe, &sdc_searcher, test_query, test_gt, 
+                           test_number, vecdim, test_gt_d, k, csv_file, "SDC", use_opq, out_dir);
+        }
     }
 
-    std::cerr << "\n[System] Done. Profiler: files/profiler_detail_*_T"
-              << profile_threads << "_P" << profile_nprobe << ".csv\n";
-    std::cerr << "[System] Plot: python3 viz/run_query_profile.py\n";
+    csv_file.close();
+
+    {
+        std::ofstream meta(out_dir + "/run_info.txt");
+        meta << "algorithm=IVFPQ_ADC-SDC\n";
+        meta << "n_lists=" << n_lists << "\n";
+        meta << "M=" << FS_M << "\n";
+        meta << "use_opq=" << use_opq << "\n";
+        meta << "test_queries=" << test_number << "\n";
+        meta << "k=" << k << "\n";
+    }
+
+    std::cerr << "\n[System] All evaluations completed. Results in " << out_dir << "\n";
 
     delete[] base; 
     delete[] test_query;

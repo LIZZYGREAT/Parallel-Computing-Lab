@@ -1,13 +1,12 @@
 #pragma once
 
 #include <vector>
-#include <cmath>
 #include <cstdlib>
-#include <limits>
-#include <omp.h>
-#include <iostream>
 #include <cstring>
+#include <cmath>
 #include <random>
+#include <omp.h>
+#include <limits>
 #include <algorithm>
 #include "simd_l2.h"
 

@@ -9,18 +9,8 @@
 #include <immintrin.h>
 #endif
 
-// x86 AVX2 水平求和辅助函数
 #if defined(__AVX2__)
-inline float hsum_avx2(__m256 v) {
-    __m128 vlow  = _mm256_castps256_ps128(v);
-    __m128 vhigh = _mm256_extractf128_ps(v, 1);
-    vlow  = _mm_add_ps(vlow, vhigh);
-    __m128 shuf = _mm_movehl_ps(vlow, vlow);
-    vlow  = _mm_add_ps(vlow, shuf);
-    shuf = _mm_shuffle_ps(vlow, vlow, 1);
-    vlow  = _mm_add_ss(vlow, shuf);
-    return _mm_cvtss_f32(vlow);
-}
+#include "simd_l2.h"
 #endif
 
 inline void opq_rotate(const float* src, float* dst, int d = 96) {
