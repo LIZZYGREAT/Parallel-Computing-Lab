@@ -4,27 +4,26 @@
 #include <string>
 #include <iostream>
 #include <fstream>
-#include <omp.h>
+#include <pthread.h>
 
 template<typename T = void>
 class MicroProfilerT {
 public:
     static std::map<std::string, double> times;
-    
+    static pthread_mutex_t mutex;
+
     struct Timer {
         std::string name;
         std::chrono::high_resolution_clock::time_point start;
-        
-        Timer(std::string n) : name(n), start(std::chrono::high_resolution_clock::now()) {}
-        
+
+        Timer(std::string n) : name(std::move(n)), start(std::chrono::high_resolution_clock::now()) {}
+
         ~Timer() {
             auto end = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double, std::micro> elapsed = end - start;
-            // 确保多线程环境下的数据竞争安全
-            #pragma omp critical(micro_profiler)
-            {
-                MicroProfilerT::times[name] += elapsed.count();
-            }
+            pthread_mutex_lock(&MicroProfilerT::mutex);
+            MicroProfilerT::times[name] += elapsed.count();
+            pthread_mutex_unlock(&MicroProfilerT::mutex);
         }
     };
 
@@ -57,13 +56,15 @@ public:
         if (fout.is_open()) fout.close();
     }
 
-    static void reset() { 
-        times.clear(); 
+    static void reset() {
+        times.clear();
     }
 };
 
-// 静态成员初始化
 template<typename T>
 std::map<std::string, double> MicroProfilerT<T>::times;
+
+template<typename T>
+pthread_mutex_t MicroProfilerT<T>::mutex = PTHREAD_MUTEX_INITIALIZER;
 
 using MicroProfiler = MicroProfilerT<>;

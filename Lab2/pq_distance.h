@@ -14,20 +14,12 @@ inline float compute_l2_sqr_d3(const float* a, const float* b) {
     return d0 * d0 + d1 * d1 + d2 * d2;
 }
 
-struct SearchWorkspace {
-    AlignedBuffer<float> residual;
-    AlignedBuffer<float> lut_f;
-    AlignedBuffer<uint8_t> lut_u8;
-    AlignedBuffer<uint8_t> query_code;
-    AlignedBuffer<uint16_t> sum_arr;
-
-    SearchWorkspace() {
-        residual.resize(FS_D);
-        lut_f.resize(FS_M * 16);
-        lut_u8.resize(FS_M * 16);
-        query_code.resize(FS_M);
-        sum_arr.resize(16);
-    }
+struct alignas(64) SearchWorkspace {
+    float residual[FS_D];
+    float lut_f[FS_M * 16];
+    uint8_t lut_u8[FS_M * 16];
+    uint8_t query_code[FS_M];
+    uint16_t sum_arr[16];
 };
 
 __attribute__((always_inline)) inline void pq_build_lut16_d3(

@@ -9,7 +9,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <stdlib.h>
-#include <omp.h>
+#include "thread_pool.h"
 #include <stdio.h>
 #include <queue>
 #include <ctime>
@@ -73,7 +73,7 @@ void run_evaluation(int thread_count, int nprobe, BaseSearcher* searcher,
                     std::ofstream& csv_file, const std::string& method_name,
                     const std::string& out_dir) {
 
-    omp_set_num_threads(thread_count);
+    tp::set_num_threads(thread_count);
     MicroProfiler::reset();
 
     std::vector<SearchResult> results(test_number);
@@ -192,6 +192,8 @@ int main(int argc, char *argv[]) {
     }
 
     std::cerr << "\n[System] All evaluations completed. Results in " << out_dir << "\n";
+
+    tp::shutdown_pool();
 
     delete[] base;
     delete[] test_query;
