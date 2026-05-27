@@ -94,3 +94,25 @@ __attribute__((always_inline)) inline void fast_scan_block_accumulate(
 }
 
 #endif
+
+template<typename ScoreFn>
+__attribute__((always_inline)) inline void fast_scan_list_batch(
+    const FSBlock* blocks, size_t nb,
+    const uint8_t* lut_u8, int M,
+    uint16_t* sum_scratch, ScoreFn&& score_block) {
+    size_t b = 0;
+    for (; b + 4 <= nb; b += 4) {
+        fast_scan_block_accumulate(blocks[b],     lut_u8, M, sum_scratch);
+        score_block(blocks[b],     sum_scratch);
+        fast_scan_block_accumulate(blocks[b + 1], lut_u8, M, sum_scratch);
+        score_block(blocks[b + 1], sum_scratch);
+        fast_scan_block_accumulate(blocks[b + 2], lut_u8, M, sum_scratch);
+        score_block(blocks[b + 2], sum_scratch);
+        fast_scan_block_accumulate(blocks[b + 3], lut_u8, M, sum_scratch);
+        score_block(blocks[b + 3], sum_scratch);
+    }
+    for (; b < nb; ++b) {
+        fast_scan_block_accumulate(blocks[b], lut_u8, M, sum_scratch);
+        score_block(blocks[b], sum_scratch);
+    }
+}

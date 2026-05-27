@@ -2,15 +2,36 @@
 #include <cstdint>
 #include <limits>
 #include "simd_l2.h"
+#include "aligned_alloc.h"
+#include "ivfpq_index.h"
 
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 
+inline float compute_l2_sqr_d3(const float* a, const float* b) {
+    float d0 = a[0] - b[0], d1 = a[1] - b[1], d2 = a[2] - b[2];
+    return d0 * d0 + d1 * d1 + d2 * d2;
+}
+
+struct SearchWorkspace {
+    AlignedBuffer<float> residual;
+    AlignedBuffer<float> lut_f;
+    AlignedBuffer<uint8_t> lut_u8;
+    AlignedBuffer<uint8_t> query_code;
+    AlignedBuffer<uint16_t> sum_arr;
+
+    SearchWorkspace() {
+        residual.resize(FS_D);
+        lut_f.resize(FS_M * 16);
+        lut_u8.resize(FS_M * 16);
+        query_code.resize(FS_M);
+        sum_arr.resize(16);
+    }
+};
+
 __attribute__((always_inline)) inline void pq_build_lut16_d3(
     const float* q, const float* cents16x3, float* lut16) {
-#if defined(__AVX2__)
-    const __m128 qv = _mm_loadu_ps(q);
     const float q0 = q[0], q1 = q[1], q2 = q[2];
     #pragma GCC unroll 16
     for (int k = 0; k < 16; ++k) {
@@ -18,13 +39,6 @@ __attribute__((always_inline)) inline void pq_build_lut16_d3(
         float d0 = q0 - c[0], d1 = q1 - c[1], d2 = q2 - c[2];
         lut16[k] = d0 * d0 + d1 * d1 + d2 * d2;
     }
-    (void)qv;
-#else
-    #pragma GCC unroll 16
-    for (int k = 0; k < 16; ++k) {
-        lut16[k] = compute_l2_sqr_d3(q, cents16x3 + k * 3);
-    }
-#endif
 }
 
 __attribute__((always_inline)) inline uint8_t pq_quantize_d3_16(
@@ -49,6 +63,28 @@ __attribute__((always_inline)) inline void pq_build_adc_lut(
     const float* residual, int M, int d_sub,
     const float* pq_centroids, float* lut_out,
     float& min_val, float& max_val) {
+#if defined(__AVX2__)
+    __m256 vmin = _mm256_set1_ps(std::numeric_limits<float>::max());
+    __m256 vmax = _mm256_set1_ps(std::numeric_limits<float>::lowest());
+    for (int m = 0; m < M; ++m) {
+        const float* sub_q = residual + m * d_sub;
+        const float* sub_c = pq_centroids + m * 16 * d_sub;
+        float* row = lut_out + m * 16;
+        if (d_sub == 3) {
+            pq_build_lut16_d3(sub_q, sub_c, row);
+        } else {
+            for (int k = 0; k < 16; ++k) {
+                row[k] = compute_L2_sqr(sub_q, sub_c + k * d_sub, d_sub);
+            }
+        }
+        __m256 r0 = _mm256_loadu_ps(row);
+        __m256 r1 = _mm256_loadu_ps(row + 8);
+        vmin = _mm256_min_ps(vmin, _mm256_min_ps(r0, r1));
+        vmax = _mm256_max_ps(vmax, _mm256_max_ps(r0, r1));
+    }
+    min_val = hmin_avx2(vmin);
+    max_val = hmax_avx2(vmax);
+#else
     min_val = std::numeric_limits<float>::max();
     max_val = std::numeric_limits<float>::lowest();
     for (int m = 0; m < M; ++m) {
@@ -67,16 +103,23 @@ __attribute__((always_inline)) inline void pq_build_adc_lut(
             max_val = max_val > row[k] ? max_val : row[k];
         }
     }
+#endif
 }
 
-__attribute__((always_inline)) inline void pq_quantize_residual(
+__attribute__((always_inline)) inline void sdc_quantize_and_build_lut(
     const float* residual, int M, int d_sub,
-    const float* pq_centroids, uint8_t* codes_out) {
+    const float* pq_centroids, const float* center_dist_table,
+    float* lut_out, uint8_t* codes_out,
+    float& min_val, float& max_val) {
+#if defined(__AVX2__)
+    __m256 vmin = _mm256_set1_ps(std::numeric_limits<float>::max());
+    __m256 vmax = _mm256_set1_ps(std::numeric_limits<float>::lowest());
     for (int m = 0; m < M; ++m) {
         const float* sub_q = residual + m * d_sub;
         const float* sub_c = pq_centroids + m * 16 * d_sub;
+        uint8_t q_code;
         if (d_sub == 3) {
-            codes_out[m] = pq_quantize_d3_16(sub_q, sub_c);
+            q_code = pq_quantize_d3_16(sub_q, sub_c);
         } else {
             float min_dist = std::numeric_limits<float>::max();
             uint8_t best = 0;
@@ -87,40 +130,79 @@ __attribute__((always_inline)) inline void pq_quantize_residual(
                     best = static_cast<uint8_t>(k);
                 }
             }
-            codes_out[m] = best;
+            q_code = best;
         }
+        codes_out[m] = q_code;
+        const float* row = center_dist_table + m * 256 + q_code * 16;
+        float* lut_row = lut_out + m * 16;
+        __m256 v0 = _mm256_loadu_ps(row);
+        __m256 v1 = _mm256_loadu_ps(row + 8);
+        _mm256_storeu_ps(lut_row, v0);
+        _mm256_storeu_ps(lut_row + 8, v1);
+        vmin = _mm256_min_ps(vmin, _mm256_min_ps(v0, v1));
+        vmax = _mm256_max_ps(vmax, _mm256_max_ps(v0, v1));
     }
-}
-
-__attribute__((always_inline)) inline void sdc_lut_from_table_row(
-    const float* row16, float* lut16, float& min_val, float& max_val) {
-#if defined(__AVX2__)
-    __m256 v0 = _mm256_loadu_ps(row16);
-    __m256 v1 = _mm256_loadu_ps(row16 + 8);
-    _mm256_storeu_ps(lut16, v0);
-    _mm256_storeu_ps(lut16 + 8, v1);
-    __m256 mn = _mm256_min_ps(v0, v1);
-    __m256 mx = _mm256_max_ps(v0, v1);
-    const __m128 mn8 = _mm256_castps256_ps128(mn);
-    const __m128 mx8 = _mm256_castps256_ps128(mx);
-    min_val = _mm_cvtss_f32(_mm_min_ps(mn8, _mm256_extractf128_ps(mn, 1)));
-    max_val = _mm_cvtss_f32(_mm_max_ps(mx8, _mm256_extractf128_ps(mx, 1)));
+    min_val = hmin_avx2(vmin);
+    max_val = hmax_avx2(vmax);
 #else
     min_val = std::numeric_limits<float>::max();
     max_val = std::numeric_limits<float>::lowest();
-    for (int k = 0; k < 16; ++k) {
-        lut16[k] = row16[k];
-        if (lut16[k] < min_val) min_val = lut16[k];
-        if (lut16[k] > max_val) max_val = lut16[k];
+    for (int m = 0; m < M; ++m) {
+        const float* sub_q = residual + m * d_sub;
+        const float* sub_c = pq_centroids + m * 16 * d_sub;
+        uint8_t q_code;
+        if (d_sub == 3) {
+            q_code = pq_quantize_d3_16(sub_q, sub_c);
+        } else {
+            float min_dist = std::numeric_limits<float>::max();
+            uint8_t best = 0;
+            for (int k = 0; k < 16; ++k) {
+                float dist = compute_L2_sqr(sub_q, sub_c + k * d_sub, d_sub);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    best = static_cast<uint8_t>(k);
+                }
+            }
+            q_code = best;
+        }
+        codes_out[m] = q_code;
+        const float* row = center_dist_table + m * 256 + q_code * 16;
+        float* lut_row = lut_out + m * 16;
+        for (int k = 0; k < 16; ++k) {
+            lut_row[k] = row[k];
+            if (lut_row[k] < min_val) min_val = lut_row[k];
+            if (lut_row[k] > max_val) max_val = lut_row[k];
+        }
     }
 #endif
 }
 
 __attribute__((always_inline)) inline void lut_float_to_u8(
     const float* lut, int n, float min_val, float inv_scale, uint8_t* out) {
+#if defined(__AVX2__)
+    const __m256 vmin = _mm256_set1_ps(min_val);
+    const __m256 vscale = _mm256_set1_ps(inv_scale);
+    const __m256i vmax_i = _mm256_set1_epi32(255);
+    const __m256i vzero = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(lut + i), vmin), vscale);
+        __m256i iv = _mm256_cvtps_epi32(v);
+        iv = _mm256_max_epi32(vzero, _mm256_min_epi32(iv, vmax_i));
+        __m128i lo = _mm256_castsi256_si128(iv);
+        __m128i hi = _mm256_extracti128_si256(iv, 1);
+        __m128i pack16 = _mm_packus_epi32(lo, hi);
+        __m128i pack8 = _mm_packus_epi16(pack16, pack16);
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out + i), pack8);
+    }
+    for (; i < n; ++i) {
+        out[i] = static_cast<uint8_t>((lut[i] - min_val) * inv_scale);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         out[i] = static_cast<uint8_t>((lut[i] - min_val) * inv_scale);
     }
+#endif
 }
 
 #if defined(__ARM_NEON) || defined(__aarch64__)

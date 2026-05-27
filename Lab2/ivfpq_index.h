@@ -12,11 +12,12 @@
 #include "kmeans.h"
 #include "profiler.h"
 #include "simd_l2.h"
+#include "aligned_alloc.h"
 
-constexpr int FS_D = 96;          
-constexpr int FS_M = 32;          
-constexpr int FS_K = 16;          
-constexpr int FS_D_SUB = 3;       
+constexpr int FS_D = 96;
+constexpr int FS_M = 32;
+constexpr int FS_K = 16;
+constexpr int FS_D_SUB = 3;
 
 struct alignas(16) FSBlock {
     uint8_t codes[FS_M][16];
@@ -25,36 +26,13 @@ struct alignas(16) FSBlock {
 
 struct InvertedList {
     std::vector<FSBlock> blocks;
-    size_t total_elements = 0; 
+    size_t total_elements = 0;
 };
 
 struct TempVec {
     uint8_t code[FS_M];
     uint32_t id;
 };
-
-template <typename T, std::size_t Alignment>
-struct AlignedAllocator {
-    using value_type = T;
-    AlignedAllocator() noexcept = default;
-    template <typename U> AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
-    
-    T* allocate(std::size_t n) {
-        void* ptr = nullptr;
-        if (posix_memalign(&ptr, Alignment, n * sizeof(T)) != 0) {
-            throw std::bad_alloc();
-        }
-        return static_cast<T*>(ptr);
-    }
-    
-    void deallocate(T* p, std::size_t) noexcept {
-        free(p);
-    }
-    template <typename U> struct rebind { using other = AlignedAllocator<U, Alignment>; };
-};
-
-template<typename T>
-using AlignedVector = std::vector<T, AlignedAllocator<T, 64>>;
 
 class IVFPQIndex {
 public:

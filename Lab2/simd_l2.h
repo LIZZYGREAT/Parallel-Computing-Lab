@@ -16,6 +16,24 @@ inline float hsum_avx2(__m256 v) {
     vlow  = _mm_add_ss(vlow, shuf);
     return _mm_cvtss_f32(vlow);
 }
+
+inline float hmin_avx2(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_min_ps(lo, hi);
+    lo = _mm_min_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    lo = _mm_min_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtss_f32(lo);
+}
+
+inline float hmax_avx2(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_max_ps(lo, hi);
+    lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtss_f32(lo);
+}
 #endif
 
 inline float compute_L2_sqr(const float* a, const float* b, int d) __attribute__((always_inline));
@@ -66,5 +84,32 @@ inline float compute_L2_sqr(const float* a, const float* b, int d) {
             float diff = a[i] - b[i]; dist += diff * diff;
         }
         return dist;
+    }
+}
+
+inline void compute_all_L2_sqr_d96(const float* q, const float* cents, int nlist, float* out) {
+    int c = 0;
+    for (; c + 4 <= nlist; c += 4) {
+        out[c]     = compute_L2_sqr(q, cents + c * 96, 96);
+        out[c + 1] = compute_L2_sqr(q, cents + (c + 1) * 96, 96);
+        out[c + 2] = compute_L2_sqr(q, cents + (c + 2) * 96, 96);
+        out[c + 3] = compute_L2_sqr(q, cents + (c + 3) * 96, 96);
+    }
+    for (; c < nlist; ++c) {
+        out[c] = compute_L2_sqr(q, cents + c * 96, 96);
+    }
+}
+
+inline void rerank_batch_d96(const float* q, const float* base, int d,
+                             uint32_t* ids, float* dists, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        dists[i]     = compute_L2_sqr(q, base + ids[i] * d, d);
+        dists[i + 1] = compute_L2_sqr(q, base + ids[i + 1] * d, d);
+        dists[i + 2] = compute_L2_sqr(q, base + ids[i + 2] * d, d);
+        dists[i + 3] = compute_L2_sqr(q, base + ids[i + 3] * d, d);
+    }
+    for (; i < n; ++i) {
+        dists[i] = compute_L2_sqr(q, base + ids[i] * d, d);
     }
 }
